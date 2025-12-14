@@ -51,7 +51,8 @@ const JWT_EXPIRY = process.env.JWT_EXPIRY || '7d';
 const MINIO_VIDEOS_BUCKET = process.env.MINIO_VIDEOS_BUCKET || 'videos';
 const MINIO_IMAGES_BUCKET = process.env.MINIO_IMAGES_BUCKET || 'images';
 const MINIO_HLS_BUCKET = process.env.MINIO_HLS_BUCKET || 'hls';
-const MINIO_PUBLIC_URL = process.env.MINIO_PUBLIC_URL || 'http://localhost:9000';
+// MinIO Public URL for generating public URLs (accessible by browser)
+const MINIO_PUBLIC_URL = process.env.MINIO_PUBLIC_URL || 'http://74.208.158.126:9000';
 
 // Upload Configuration
 const MAX_FILE_SIZE = parseInt(process.env.MAX_FILE_SIZE || '104857600'); // 100MB default
@@ -213,12 +214,13 @@ const MINIO_PUBLIC_ENDPOINT = process.env.MINIO_PUBLIC_ENDPOINT || '74.208.158.1
 const MINIO_PUBLIC_PORT = parseInt(process.env.MINIO_PUBLIC_PORT || '9000');
 
 // Internal client for operations (bucket creation, etc.)
+// This client connects to MinIO via internal Docker network
 const minioClient = new Minio.Client({
   endPoint: MINIO_INTERNAL_ENDPOINT,
   port: MINIO_INTERNAL_PORT,
   useSSL: false,
   accessKey: process.env.MINIO_ROOT_USER || 'minio_admin',
-  secretKey: process.env.MINIO_ROOT_PASSWORD || 'secure_minio_password_change_me',
+  secretKey: process.env.MINIO_ROOT_PASSWORD || 'secure_minio_password_change_me'
 });
 
 // Public client for presigned URLs (uses public endpoint)
@@ -887,22 +889,73 @@ app.post('/upload/direct', authenticate, upload.single('file'), async (req, res)
   console.log(`[DIRECT UPLOAD] User ${req.user.id} uploading ${file.mimetype} (${file.size} bytes) to ${bucket}`);
   
   try {
-    // Ensure bucket exists
-    const bucketExists = await minioClient.bucketExists(bucket);
-    if (!bucketExists) {
-      await minioClient.makeBucket(bucket, 'us-east-1');
+    // Ensure bucket exists - use internal client
+    let bucketExists = false;
+    try {
+      bucketExists = await minioClient.bucketExists(bucket);
+    } catch (checkErr) {
+      console.log(`[DIRECT UPLOAD] Error checking bucket existence: ${checkErr.message}`);
+      // Continue and try to create bucket
     }
     
-    const objectName = `${req.user.id}/${Date.now()}-${Math.random().toString(36).substring(7)}-${file.originalname}`;
+    if (!bucketExists) {
+      try {
+        await minioClient.makeBucket(bucket, 'us-east-1');
+        console.log(`[DIRECT UPLOAD] Created bucket: ${bucket}`);
+        
+        // Set bucket policy to public read
+        try {
+          await minioClient.setBucketPolicy(bucket, JSON.stringify({
+            Version: '2012-10-17',
+            Statement: [{
+              Effect: 'Allow',
+              Principal: { AWS: ['*'] },
+              Action: ['s3:GetObject'],
+              Resource: [`arn:aws:s3:::${bucket}/*`]
+            }]
+          }));
+          console.log(`[DIRECT UPLOAD] Set public policy for bucket: ${bucket}`);
+        } catch (policyErr) {
+          console.log(`[DIRECT UPLOAD] Note: Could not set bucket policy (non-critical): ${policyErr.message}`);
+        }
+      } catch (createErr) {
+        console.error(`[DIRECT UPLOAD] Error creating bucket: ${createErr.message}`);
+        // Try to continue - bucket might already exist
+      }
+    }
     
-    await minioClient.putObject(bucket, objectName, file.buffer, {
-      'Content-Type': file.mimetype,
-      'Content-Length': file.size
+    const objectName = `${req.user.id}/${Date.now()}-${Math.random().toString(36).substring(7)}-${file.originalname.replace(/[^a-zA-Z0-9.-]/g, '_')}`;
+    
+    console.log(`[DIRECT UPLOAD] Attempting to upload to MinIO: ${MINIO_INTERNAL_ENDPOINT}:${MINIO_INTERNAL_PORT}, bucket: ${bucket}`);
+    console.log(`[DIRECT UPLOAD] MinIO Client config - endpoint: ${MINIO_INTERNAL_ENDPOINT}, port: ${MINIO_INTERNAL_PORT}, bucket: ${bucket}`);
+    
+    // Test MinIO connection first
+    try {
+      const testBucketExists = await minioClient.bucketExists(bucket);
+      console.log(`[DIRECT UPLOAD] Bucket ${bucket} exists: ${testBucketExists}`);
+    } catch (testErr) {
+      console.error(`[DIRECT UPLOAD] Error testing MinIO connection: ${testErr.message}`);
+      console.error(`[DIRECT UPLOAD] Error stack:`, testErr.stack);
+      throw new Error(`MinIO connection failed: ${testErr.message}`);
+    }
+    
+    // MinIO putObject signature: putObject(bucketName, objectName, stream, size, metaData)
+    // Convert buffer to stream
+    const { Readable } = require('stream');
+    const bufferStream = new Readable();
+    bufferStream.push(file.buffer);
+    bufferStream.push(null); // End the stream
+    
+    console.log(`[DIRECT UPLOAD] Uploading file: ${objectName}, size: ${file.size} bytes, type: ${file.mimetype}`);
+    
+    await minioClient.putObject(bucket, objectName, bufferStream, file.size, {
+      'Content-Type': file.mimetype
     });
     
-    const publicUrl = `${MINIO_PUBLIC_URL}/${bucket}/${objectName}`;
+    // Construct public URL - use the public endpoint configured
+    const publicUrl = `http://${MINIO_PUBLIC_ENDPOINT}:${MINIO_PUBLIC_PORT}/${bucket}/${objectName}`;
     
-    console.log(`[DIRECT UPLOAD] File uploaded successfully: ${objectName}`);
+    console.log(`[DIRECT UPLOAD] File uploaded successfully: ${objectName}, URL: ${publicUrl}`);
     res.json({
       success: true,
       url: publicUrl,
@@ -913,7 +966,8 @@ app.post('/upload/direct', authenticate, upload.single('file'), async (req, res)
     });
   } catch (err) {
     console.error(`[DIRECT UPLOAD] Error:`, err.message);
-    res.status(500).json({ error: 'Upload failed' });
+    console.error(`[DIRECT UPLOAD] Error details:`, err);
+    res.status(500).json({ error: `Upload failed: ${err.message}` });
   }
 });
 
