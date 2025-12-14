@@ -695,7 +695,7 @@ app.get('/feed', async (req, res) => {
         (SELECT COUNT(*) FROM comments WHERE post_id = p.id) as commentCount
       FROM posts p
       JOIN users u ON p.user_id = u.id
-      WHERE (p.processing_status = 'COMPLETED' OR p.processing_status IS NULL)
+      WHERE (p.processing_status = 'COMPLETED' OR p.processing_status IS NULL OR p.processing_status = 'PENDING')
     `;
     const params = [];
     let paramCount = 1;
@@ -719,7 +719,7 @@ app.get('/feed', async (req, res) => {
     const countQuery = `
       SELECT COUNT(*) as total
       FROM posts p
-      WHERE (p.processing_status = 'COMPLETED' OR p.processing_status IS NULL)
+      WHERE (p.processing_status = 'COMPLETED' OR p.processing_status IS NULL OR p.processing_status = 'PENDING')
       ${type ? `AND p.type = '${type}'` : ''}
       ${userId ? `AND p.user_id = '${userId}'` : ''}
     `;
@@ -795,7 +795,8 @@ app.post('/posts', authenticate, async (req, res) => {
   
   // MODERATOR and CREATOR: Can post both THREAD and VIDEO
 
-  // Initial status for videos is PENDING, for threads it is NULL (or COMPLETED implicitly)
+  // Videos start as PENDING and are processed to HLS by the worker
+  // This enables chunked streaming like Instagram
   const processingStatus = type === 'VIDEO' ? 'PENDING' : 'COMPLETED';
 
   try {
@@ -1699,7 +1700,7 @@ app.post('/conversations', authenticate, async (req, res) => {
 
 // 27. STORIES - CREATE STORY
 app.post('/stories', authenticate, async (req, res) => {
-  const { mediaUrl, mediaType } = req.body;
+  const { mediaUrl, mediaType, metadata } = req.body;
   const userId = req.user.id;
   
   if (!mediaUrl || !mediaType) {
@@ -1715,6 +1716,17 @@ app.post('/stories', authenticate, async (req, res) => {
       RETURNING id, media_url, media_type, expires_at, created_at
     `, [userId, mediaUrl, mediaType, expiresAt]);
     
+    const storyId = result.rows[0].id;
+    
+    // Store metadata (text, emojis, etc.) if provided
+    if (metadata) {
+      await pool.query(`
+        INSERT INTO story_metadata (story_id, metadata)
+        VALUES ($1, $2)
+        ON CONFLICT (story_id) DO UPDATE SET metadata = $2
+      `, [storyId, typeof metadata === 'string' ? metadata : JSON.stringify(metadata)]);
+    }
+    
     res.json(result.rows[0]);
   } catch (err) {
     console.error(`[CREATE STORY] Error:`, err.message);
@@ -1727,14 +1739,16 @@ app.get('/stories', authenticate, async (req, res) => {
   const userId = req.user.id;
   
   try {
-    const result = await pool.query(`
+      const result = await pool.query(`
       SELECT DISTINCT
         s.id, s.media_url, s.media_type, s.expires_at, s.views_count, s.created_at,
         u.id as user_id, u.username, u.avatar_url, u.full_name,
-        (SELECT COUNT(*) FROM story_views WHERE story_id = s.id AND viewer_id = $1) > 0 as viewed_by_me
+        (SELECT COUNT(*) FROM story_views WHERE story_id = s.id AND viewer_id = $1) > 0 as viewed_by_me,
+        sm.metadata
       FROM stories s
       JOIN users u ON s.user_id = u.id
       LEFT JOIN follows f ON f.following_id = s.user_id AND f.follower_id = $1
+      LEFT JOIN story_metadata sm ON sm.story_id = s.id
       WHERE s.expires_at > CURRENT_TIMESTAMP
         AND (s.user_id = $1 OR f.follower_id = $1)
       ORDER BY s.created_at DESC
@@ -1760,7 +1774,8 @@ app.get('/stories', authenticate, async (req, res) => {
         expires_at: story.expires_at,
         views_count: story.views_count,
         created_at: story.created_at,
-        viewed_by_me: story.viewed_by_me
+        viewed_by_me: story.viewed_by_me,
+        metadata: story.metadata
       });
     });
     
@@ -1798,6 +1813,115 @@ app.post('/stories/:id/view', authenticate, async (req, res) => {
   } catch (err) {
     console.error(`[VIEW STORY] Error:`, err.message);
     res.status(500).json({ error: 'Could not record story view' });
+  }
+});
+
+// 29a. STORIES - ADD COMMENT
+app.post('/stories/:id/comments', authenticate, async (req, res) => {
+  const { id: storyId } = req.params;
+  const { content } = req.body;
+  const userId = req.user.id;
+  
+  if (!content || content.trim().length === 0) {
+    return res.status(400).json({ error: 'Comment content is required' });
+  }
+  
+  try {
+    // Get story owner
+    const storyResult = await pool.query('SELECT user_id FROM stories WHERE id = $1', [storyId]);
+    if (storyResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Story not found' });
+    }
+    
+    const storyOwnerId = storyResult.rows[0].user_id;
+    
+    // Insert comment (we'll use a story_comments table or reuse comments with story_id)
+    // For now, let's create a story_comments table
+    const commentResult = await pool.query(`
+      INSERT INTO story_comments (story_id, user_id, content, created_at)
+      VALUES ($1, $2, $3, NOW())
+      RETURNING id, content, created_at
+    `, [storyId, userId, content.trim()]);
+    
+    // Get comment with user info
+    const fullComment = await pool.query(`
+      SELECT sc.id, sc.content, sc.created_at as timestamp,
+             u.id as "userId", u.username as "userName", u.avatar_url as "userAvatar"
+      FROM story_comments sc
+      JOIN users u ON sc.user_id = u.id
+      WHERE sc.id = $1
+    `, [commentResult.rows[0].id]);
+    
+    // Send message to story owner if commenter is not the owner
+    if (storyOwnerId !== userId) {
+      try {
+        // Find or create conversation
+        const convResult = await pool.query(`
+          SELECT id FROM conversations 
+          WHERE (user1_id = $1 AND user2_id = $2) OR (user1_id = $2 AND user2_id = $1)
+        `, [storyOwnerId, userId]);
+        
+        let conversationId;
+        if (convResult.rows.length === 0) {
+          const newConv = await pool.query(`
+            INSERT INTO conversations (user1_id, user2_id, last_message_at)
+            VALUES ($1, $2, NOW())
+            RETURNING id
+          `, [storyOwnerId, userId]);
+          conversationId = newConv.rows[0].id;
+        } else {
+          conversationId = convResult.rows[0].id;
+        }
+        
+        // Send message notification
+        await pool.query(`
+          INSERT INTO messages (conversation_id, sender_id, content, created_at)
+          VALUES ($1, $2, $3, NOW())
+        `, [conversationId, userId, `commented on your story: "${content.trim()}"`]);
+        
+        // Update conversation timestamp
+        await pool.query(`
+          UPDATE conversations SET last_message_at = NOW() WHERE id = $1
+        `, [conversationId]);
+      } catch (msgErr) {
+        console.error(`[STORY COMMENT] Error sending message notification:`, msgErr.message);
+        // Don't fail the comment if message fails
+      }
+    }
+    
+    res.json({
+      ...fullComment.rows[0],
+      timestamp: new Date(fullComment.rows[0].timestamp).getTime()
+    });
+  } catch (err) {
+    console.error(`[STORY COMMENT] Error:`, err.message);
+    res.status(500).json({ error: 'Could not add comment' });
+  }
+});
+
+// 29b. STORIES - GET COMMENTS
+app.get('/stories/:id/comments', authenticate, async (req, res) => {
+  const { id: storyId } = req.params;
+  
+  try {
+    const result = await pool.query(`
+      SELECT sc.id, sc.content, sc.created_at as timestamp,
+             u.id as "userId", u.username as "userName", u.avatar_url as "userAvatar"
+      FROM story_comments sc
+      JOIN users u ON sc.user_id = u.id
+      WHERE sc.story_id = $1
+      ORDER BY sc.created_at ASC
+    `, [storyId]);
+    
+    res.json({
+      comments: result.rows.map(row => ({
+        ...row,
+        timestamp: new Date(row.timestamp).getTime()
+      }))
+    });
+  } catch (err) {
+    console.error(`[STORY COMMENTS] Error:`, err.message);
+    res.status(500).json({ error: 'Could not fetch comments' });
   }
 });
 
