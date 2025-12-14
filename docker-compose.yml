@@ -36,9 +36,9 @@ services:
       retries: 5
 
   # 2. MinIO Object Storage
-  medgram_storage:
+  medgram-storage:
     image: minio/minio
-    container_name: medgram_storage
+    container_name: medgram-storage
     command: server /data --console-address ":9001"
     environment:
       MINIO_ROOT_USER: minio_admin
@@ -60,7 +60,7 @@ services:
   create-buckets:
     image: minio/mc
     depends_on:
-      medgram_storage:
+      medgram-storage:
         condition: service_healthy
     entrypoint: >
       /bin/sh -c "
@@ -103,7 +103,7 @@ services:
     restart: always
     environment:
       POSTGRES_HOST: medgram_db
-      MINIO_ENDPOINT: medgram_storage
+      MINIO_ENDPOINT: medgram-storage
       PORT: 4000
       # Points to your server IP so devices can access media
       MINIO_PUBLIC_URL: http://74.208.158.126:9000
@@ -126,7 +126,7 @@ services:
     depends_on:
       medgram_db:
         condition: service_healthy
-      medgram_storage:
+      medgram-storage:
         condition: service_healthy
 
   # 5. Video Processing Worker
@@ -139,14 +139,14 @@ services:
     command: ["npm", "run", "worker"]
     environment:
       POSTGRES_HOST: medgram_db
-      MINIO_ENDPOINT: medgram_storage
+      MINIO_ENDPOINT: medgram-storage
       MINIO_PUBLIC_URL: http://74.208.158.126:9000
     networks:
       - medgram_network
     depends_on:
       medgram_db:
         condition: service_healthy
-      medgram_storage:
+      medgram-storage:
         condition: service_healthy
       medgram_backend:
         condition: service_started
