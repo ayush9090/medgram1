@@ -1,12 +1,17 @@
-# Backend files (not needed for frontend build)
-backend/
+# Note: backend/ is NOT excluded here because it's needed for backend Docker builds
+# Frontend builds use Dockerfile.frontend which has its own context
+
+# Node modules (will be installed in container)
 node_modules/
+
+# Git files
 .git/
 .gitignore
 
-# Docker files
+# Docker compose (not needed in image)
 docker-compose.yml
-Dockerfile
+
+# Documentation (not needed in image)
 *.md
 
 # Environment files (will be handled separately if needed)
@@ -16,4 +21,8 @@ Dockerfile
 # Build outputs
 dist/
 build/
+
+# Frontend-specific (only for frontend build, but backend build context is root)
+# So we keep these but they won't affect backend build since backend Dockerfile
+# explicitly copies from backend/ directory
 
