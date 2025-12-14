@@ -454,8 +454,14 @@ app.post('/auth/login', async (req, res) => {
     // Remove sensitive data from response
     delete user.password_hash;
     delete user.verification_code;
+    // Ensure username is returned (use full_name if available, otherwise username)
+    const userResponse = {
+      ...user,
+      username: user.username || user.email || user.phone,
+      fullName: user.full_name || user.username || user.email || user.phone
+    };
     console.log(`[LOGIN] Successful login for user: ${username}, role: ${user.role}`);
-    res.json({ user, token });
+    res.json({ user: userResponse, token });
   } catch (err) {
     console.error(`[LOGIN] Error:`, err.message);
     res.status(500).json({ error: 'Internal error' });
@@ -690,7 +696,7 @@ app.get('/feed', async (req, res) => {
       SELECT 
         p.id, p.type, p.content, p.media_url as "mediaUrl", p.thumbnail_url as "thumbnailUrl", 
         p.created_at as timestamp, p.processing_status,
-        u.id as "authorId", u.username as "authorName", u.avatar_url as "authorAvatar", u.role as "authorRole",
+        u.id as "authorId", COALESCE(u.full_name, u.username) as "authorName", u.avatar_url as "authorAvatar", u.role as "authorRole",
         (SELECT COUNT(*) FROM likes WHERE post_id = p.id) as likes,
         (SELECT COUNT(*) FROM comments WHERE post_id = p.id) as commentCount
       FROM posts p
@@ -1165,7 +1171,7 @@ app.get('/users/:id/posts', async (req, res) => {
       SELECT 
         p.id, p.type, p.content, p.media_url as "mediaUrl", p.thumbnail_url as "thumbnailUrl", 
         p.created_at as timestamp, p.processing_status,
-        u.id as "authorId", u.username as "authorName", u.avatar_url as "authorAvatar", u.role as "authorRole",
+        u.id as "authorId", COALESCE(u.full_name, u.username) as "authorName", u.avatar_url as "authorAvatar", u.role as "authorRole",
         (SELECT COUNT(*) FROM likes WHERE post_id = p.id) as likes
       FROM posts p
       JOIN users u ON p.user_id = u.id
@@ -1410,7 +1416,7 @@ app.get('/users/:id/saved', authenticate, async (req, res) => {
       SELECT 
         p.id, p.type, p.content, p.media_url as "mediaUrl", p.thumbnail_url as "thumbnailUrl", 
         p.created_at as timestamp, p.processing_status,
-        u.id as "authorId", u.username as "authorName", u.avatar_url as "authorAvatar", u.role as "authorRole",
+        u.id as "authorId", COALESCE(u.full_name, u.username) as "authorName", u.avatar_url as "authorAvatar", u.role as "authorRole",
         (SELECT COUNT(*) FROM likes WHERE post_id = p.id) as likes,
         s.created_at as "savedAt"
       FROM saves s
@@ -2185,6 +2191,17 @@ const initDb = async () => {
                 viewer_id UUID REFERENCES users(id),
                 viewed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 PRIMARY KEY (story_id, viewer_id)
+            );
+            CREATE TABLE IF NOT EXISTS story_metadata (
+                story_id UUID PRIMARY KEY REFERENCES stories(id) ON DELETE CASCADE,
+                metadata JSONB
+            );
+            CREATE TABLE IF NOT EXISTS story_comments (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                story_id UUID REFERENCES stories(id) ON DELETE CASCADE,
+                user_id UUID REFERENCES users(id),
+                content TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
             CREATE TABLE IF NOT EXISTS comment_threads (
                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
