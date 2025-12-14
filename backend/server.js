@@ -208,13 +208,20 @@ const pool = new Pool({
 // --- MINIO CONNECTION ---
 // Connects to the 'medgram_storage' container from your stack (Internal Docker Network)
 // For presigned URLs, we need to use the public URL
-const MINIO_INTERNAL_ENDPOINT = process.env.MINIO_ENDPOINT || 'medgram_storage';
+const MINIO_INTERNAL_ENDPOINT = process.env.MINIO_ENDPOINT || 'medgram-storage';
 const MINIO_INTERNAL_PORT = parseInt(process.env.MINIO_PORT || '9000');
 const MINIO_PUBLIC_ENDPOINT = process.env.MINIO_PUBLIC_ENDPOINT || '74.208.158.126'; // Public IP or domain
 const MINIO_PUBLIC_PORT = parseInt(process.env.MINIO_PUBLIC_PORT || '9000');
 
 // Internal client for operations (bucket creation, etc.)
 // This client connects to MinIO via internal Docker network
+console.log(`[MINIO INIT] Creating MinIO client with endpoint: ${MINIO_INTERNAL_ENDPOINT}, port: ${MINIO_INTERNAL_PORT}`);
+console.log(`[MINIO INIT] Environment variables - MINIO_ENDPOINT: ${process.env.MINIO_ENDPOINT}, MINIO_PORT: ${process.env.MINIO_PORT}`);
+console.log(`[MINIO INIT] MINIO_ROOT_USER: ${process.env.MINIO_ROOT_USER || 'minio_admin'}`);
+
+// MinIO client - connects via Docker internal network
+// Changed service name from medgram_storage to medgram-storage (hyphens instead of underscores)
+// because MinIO client rejects hostnames with underscores as "invalid hostname"
 const minioClient = new Minio.Client({
   endPoint: MINIO_INTERNAL_ENDPOINT,
   port: MINIO_INTERNAL_PORT,
@@ -222,6 +229,8 @@ const minioClient = new Minio.Client({
   accessKey: process.env.MINIO_ROOT_USER || 'minio_admin',
   secretKey: process.env.MINIO_ROOT_PASSWORD || 'secure_minio_password_change_me'
 });
+
+console.log(`[MINIO INIT] MinIO client created successfully`);
 
 // Public client for presigned URLs (uses public endpoint)
 const minioPublicClient = new Minio.Client({
