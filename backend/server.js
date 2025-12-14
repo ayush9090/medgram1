@@ -1011,12 +1011,25 @@ app.get('/health', async (req, res) => {
 // 7. GET USER PROFILE (with stats)
 app.get('/users/:id', async (req, res) => {
   const { id } = req.params;
-  console.log(`[USER PROFILE] Fetching profile for user: ${id}`);
+  const token = req.headers.authorization?.split(' ')[1];
+  let currentUserId = null;
+  
+  // Try to get current user if authenticated (optional for public profiles)
+  if (token) {
+    try {
+      const decoded = jwt.verify(token, JWT_SECRET);
+      currentUserId = decoded.id;
+    } catch (err) {
+      // Invalid token, continue without authentication
+    }
+  }
+  
+  console.log(`[USER PROFILE] Fetching profile for user: ${id}${currentUserId ? ` (viewed by: ${currentUserId})` : ''}`);
   
   try {
     const result = await pool.query(
       `SELECT id, username, email, phone, full_name, role, avatar_url, verified, created_at, 
-              npi_number, state_license, user_type
+              npi_number, state_license, user_type, bio
        FROM users WHERE id = $1`,
       [id]
     );
@@ -1031,9 +1044,19 @@ app.get('/users/:id', async (req, res) => {
     // Get dynamic stats
     const [postsCount, followersCount, followingCount] = await Promise.all([
       pool.query('SELECT COUNT(*) as count FROM posts WHERE user_id = $1 AND (processing_status = \'COMPLETED\' OR processing_status IS NULL)', [id]),
-      pool.query('SELECT COUNT(*) as count FROM follows WHERE following_id = $1', [id]), // Assuming follows table
+      pool.query('SELECT COUNT(*) as count FROM follows WHERE following_id = $1', [id]),
       pool.query('SELECT COUNT(*) as count FROM follows WHERE follower_id = $1', [id])
     ]);
+    
+    // Check if current user is following this profile user
+    let isFollowing = false;
+    if (currentUserId && currentUserId !== id) {
+      const followCheck = await pool.query(
+        'SELECT * FROM follows WHERE follower_id = $1 AND following_id = $2',
+        [currentUserId, id]
+      );
+      isFollowing = followCheck.rows.length > 0;
+    }
     
     const profile = {
       ...user,
@@ -1041,10 +1064,11 @@ app.get('/users/:id', async (req, res) => {
         posts: parseInt(postsCount.rows[0].count),
         followers: parseInt(followersCount.rows[0].count),
         following: parseInt(followingCount.rows[0].count)
-      }
+      },
+      isFollowing: isFollowing
     };
     
-    console.log(`[USER PROFILE] Profile retrieved for: ${user.username}`);
+    console.log(`[USER PROFILE] Profile retrieved for: ${user.username}, isFollowing: ${isFollowing}`);
     res.json(profile);
   } catch (err) {
     console.error(`[USER PROFILE] Error:`, err.message);
@@ -1273,6 +1297,29 @@ app.get('/posts/:id/comments', async (req, res) => {
   } catch (err) {
     console.error(`[COMMENTS] Error:`, err.message);
     res.status(500).json({ error: 'Could not fetch comments' });
+  }
+});
+
+// 11a. GET ALL USERS (for sharing)
+app.get('/users', authenticate, async (req, res) => {
+  const limit = Math.min(parseInt(req.query.limit || '100'), 500);
+  const offset = parseInt(req.query.offset || '0');
+  
+  console.log(`[ALL USERS] Fetching users, limit: ${limit}, offset: ${offset}`);
+  
+  try {
+    const result = await pool.query(`
+      SELECT id, username, full_name, avatar_url, role, verified, email, phone
+      FROM users
+      ORDER BY created_at DESC
+      LIMIT $1 OFFSET $2
+    `, [limit, offset]);
+    
+    console.log(`[ALL USERS] Returning ${result.rows.length} users`);
+    res.json({ users: result.rows });
+  } catch (err) {
+    console.error(`[ALL USERS] Error:`, err.message);
+    res.status(500).json({ error: 'Could not fetch users' });
   }
 });
 
