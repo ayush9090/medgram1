@@ -216,15 +216,29 @@ const minioClient = new Minio.Client({
 
 // --- AUTH MIDDLEWARE ---
 const authenticate = (req, res, next) => {
-  const token = req.headers.authorization?.split(' ')[1];
-  if (!token) return res.status(401).json({ error: 'Unauthorized' });
+  const authHeader = req.headers.authorization;
+  if (!authHeader) {
+    console.log(`[AUTH] No authorization header`);
+    return res.status(401).json({ error: 'Unauthorized - No token provided' });
+  }
+  
+  const token = authHeader.startsWith('Bearer ') ? authHeader.split(' ')[1] : authHeader;
+  if (!token) {
+    console.log(`[AUTH] Invalid authorization format`);
+    return res.status(401).json({ error: 'Unauthorized - Invalid token format' });
+  }
 
   try {
     const decoded = jwt.verify(token, JWT_SECRET);
     req.user = decoded;
+    console.log(`[AUTH] Authenticated user: ${decoded.id}, role: ${decoded.role}`);
     next();
   } catch (err) {
-    res.status(401).json({ error: 'Invalid token' });
+    console.log(`[AUTH] Token verification failed:`, err.message);
+    if (err.name === 'TokenExpiredError') {
+      return res.status(401).json({ error: 'Token expired - Please login again' });
+    }
+    res.status(401).json({ error: 'Invalid or expired token' });
   }
 };
 
@@ -1439,13 +1453,402 @@ app.get('/shared/:token', async (req, res) => {
   }
 });
 
+// 23. CHAT - GET CONVERSATIONS
+app.get('/conversations', authenticate, async (req, res) => {
+  const userId = req.user.id;
+  console.log(`[CONVERSATIONS] Fetching conversations for user: ${userId}`);
+  
+  try {
+    const result = await pool.query(`
+      SELECT 
+        c.id, c.last_message_at,
+        CASE 
+          WHEN c.user1_id = $1 THEN u2.id
+          ELSE u1.id
+        END as other_user_id,
+        CASE 
+          WHEN c.user1_id = $1 THEN u2.username
+          ELSE u1.username
+        END as other_username,
+        CASE 
+          WHEN c.user1_id = $1 THEN u2.avatar_url
+          ELSE u1.avatar_url
+        END as other_avatar,
+        (SELECT content FROM messages WHERE conversation_id = c.id ORDER BY created_at DESC LIMIT 1) as last_message,
+        (SELECT COUNT(*) FROM messages WHERE conversation_id = c.id AND sender_id != $1 AND is_read = FALSE) as unread_count
+      FROM conversations c
+      JOIN users u1 ON c.user1_id = u1.id
+      JOIN users u2 ON c.user2_id = u2.id
+      WHERE c.user1_id = $1 OR c.user2_id = $1
+      ORDER BY c.last_message_at DESC NULLS LAST
+    `, [userId]);
+    
+    console.log(`[CONVERSATIONS] Returning ${result.rows.length} conversations`);
+    res.json(result.rows);
+  } catch (err) {
+    console.error(`[CONVERSATIONS] Error:`, err.message);
+    res.status(500).json({ error: 'Could not fetch conversations' });
+  }
+});
+
+// 24. CHAT - GET MESSAGES
+app.get('/conversations/:conversationId/messages', authenticate, async (req, res) => {
+  const { conversationId } = req.params;
+  const userId = req.user.id;
+  const page = parseInt(req.query.page || '1');
+  const limit = Math.min(parseInt(req.query.limit || '50'), 100);
+  const offset = (page - 1) * limit;
+  
+  try {
+    const convCheck = await pool.query(
+      'SELECT * FROM conversations WHERE id = $1 AND (user1_id = $2 OR user2_id = $2)',
+      [conversationId, userId]
+    );
+    
+    if (convCheck.rows.length === 0) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+    
+    const result = await pool.query(`
+      SELECT m.id, m.content, m.media_url, m.is_read, m.created_at,
+             u.id as sender_id, u.username as sender_username, u.avatar_url as sender_avatar
+      FROM messages m
+      JOIN users u ON m.sender_id = u.id
+      WHERE m.conversation_id = $1
+      ORDER BY m.created_at DESC
+      LIMIT $2 OFFSET $3
+    `, [conversationId, limit, offset]);
+    
+    await pool.query(
+      'UPDATE messages SET is_read = TRUE WHERE conversation_id = $1 AND sender_id != $2 AND is_read = FALSE',
+      [conversationId, userId]
+    );
+    
+    res.json(result.rows.reverse());
+  } catch (err) {
+    console.error(`[MESSAGES] Error:`, err.message);
+    res.status(500).json({ error: 'Could not fetch messages' });
+  }
+});
+
+// 25. CHAT - SEND MESSAGE
+app.post('/conversations/:conversationId/messages', authenticate, async (req, res) => {
+  const { conversationId } = req.params;
+  const { content, mediaUrl } = req.body;
+  const userId = req.user.id;
+  
+  if (!content && !mediaUrl) {
+    return res.status(400).json({ error: 'Message content or media is required' });
+  }
+  
+  try {
+    const convCheck = await pool.query(
+      'SELECT * FROM conversations WHERE id = $1 AND (user1_id = $2 OR user2_id = $2)',
+      [conversationId, userId]
+    );
+    
+    if (convCheck.rows.length === 0) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+    
+    const result = await pool.query(`
+      INSERT INTO messages (conversation_id, sender_id, content, media_url)
+      VALUES ($1, $2, $3, $4)
+      RETURNING id, content, media_url, created_at
+    `, [conversationId, userId, content || null, mediaUrl || null]);
+    
+    await pool.query(
+      'UPDATE conversations SET last_message_at = CURRENT_TIMESTAMP WHERE id = $1',
+      [conversationId]
+    );
+    
+    res.json({ ...result.rows[0], sender_id: userId });
+  } catch (err) {
+    console.error(`[SEND MESSAGE] Error:`, err.message);
+    res.status(500).json({ error: 'Could not send message' });
+  }
+});
+
+// 26. CHAT - START CONVERSATION
+app.post('/conversations', authenticate, async (req, res) => {
+  const { userId: otherUserId } = req.body;
+  const currentUserId = req.user.id;
+  
+  if (!otherUserId || otherUserId === currentUserId) {
+    return res.status(400).json({ error: 'Invalid user ID' });
+  }
+  
+  try {
+    let result = await pool.query(`
+      SELECT * FROM conversations 
+      WHERE (user1_id = $1 AND user2_id = $2) OR (user1_id = $2 AND user2_id = $1)
+    `, [currentUserId, otherUserId]);
+    
+    if (result.rows.length > 0) {
+      return res.json({ conversationId: result.rows[0].id, existing: true });
+    }
+    
+    const user1Id = currentUserId < otherUserId ? currentUserId : otherUserId;
+    const user2Id = currentUserId < otherUserId ? otherUserId : currentUserId;
+    
+    result = await pool.query(`
+      INSERT INTO conversations (user1_id, user2_id)
+      VALUES ($1, $2)
+      RETURNING id
+    `, [user1Id, user2Id]);
+    
+    res.json({ conversationId: result.rows[0].id, existing: false });
+  } catch (err) {
+    console.error(`[START CONVERSATION] Error:`, err.message);
+    res.status(500).json({ error: 'Could not create conversation' });
+  }
+});
+
+// 27. STORIES - CREATE STORY
+app.post('/stories', authenticate, async (req, res) => {
+  const { mediaUrl, mediaType } = req.body;
+  const userId = req.user.id;
+  
+  if (!mediaUrl || !mediaType) {
+    return res.status(400).json({ error: 'Media URL and type are required' });
+  }
+  
+  try {
+    const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000);
+    
+    const result = await pool.query(`
+      INSERT INTO stories (user_id, media_url, media_type, expires_at)
+      VALUES ($1, $2, $3, $4)
+      RETURNING id, media_url, media_type, expires_at, created_at
+    `, [userId, mediaUrl, mediaType, expiresAt]);
+    
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error(`[CREATE STORY] Error:`, err.message);
+    res.status(500).json({ error: 'Could not create story' });
+  }
+});
+
+// 28. STORIES - GET ACTIVE STORIES
+app.get('/stories', authenticate, async (req, res) => {
+  const userId = req.user.id;
+  
+  try {
+    const result = await pool.query(`
+      SELECT DISTINCT
+        s.id, s.media_url, s.media_type, s.expires_at, s.views_count, s.created_at,
+        u.id as user_id, u.username, u.avatar_url, u.full_name,
+        (SELECT COUNT(*) FROM story_views WHERE story_id = s.id AND viewer_id = $1) > 0 as viewed_by_me
+      FROM stories s
+      JOIN users u ON s.user_id = u.id
+      LEFT JOIN follows f ON f.following_id = s.user_id AND f.follower_id = $1
+      WHERE s.expires_at > CURRENT_TIMESTAMP
+        AND (s.user_id = $1 OR f.follower_id = $1)
+      ORDER BY s.created_at DESC
+    `, [userId]);
+    
+    const storiesByUser = {};
+    result.rows.forEach(story => {
+      if (!storiesByUser[story.user_id]) {
+        storiesByUser[story.user_id] = {
+          user: {
+            id: story.user_id,
+            username: story.username,
+            avatar_url: story.avatar_url,
+            full_name: story.full_name
+          },
+          stories: []
+        };
+      }
+      storiesByUser[story.user_id].stories.push({
+        id: story.id,
+        media_url: story.media_url,
+        media_type: story.media_type,
+        expires_at: story.expires_at,
+        views_count: story.views_count,
+        created_at: story.created_at,
+        viewed_by_me: story.viewed_by_me
+      });
+    });
+    
+    res.json(Object.values(storiesByUser));
+  } catch (err) {
+    console.error(`[STORIES] Error:`, err.message);
+    res.status(500).json({ error: 'Could not fetch stories' });
+  }
+});
+
+// 29. STORIES - VIEW STORY
+app.post('/stories/:id/view', authenticate, async (req, res) => {
+  const { id: storyId } = req.params;
+  const userId = req.user.id;
+  
+  try {
+    const existing = await pool.query(
+      'SELECT * FROM story_views WHERE story_id = $1 AND viewer_id = $2',
+      [storyId, userId]
+    );
+    
+    if (existing.rows.length === 0) {
+      await pool.query(
+        'INSERT INTO story_views (story_id, viewer_id) VALUES ($1, $2)',
+        [storyId, userId]
+      );
+      
+      await pool.query(
+        'UPDATE stories SET views_count = views_count + 1 WHERE id = $1',
+        [storyId]
+      );
+    }
+    
+    res.json({ success: true });
+  } catch (err) {
+    console.error(`[VIEW STORY] Error:`, err.message);
+    res.status(500).json({ error: 'Could not record story view' });
+  }
+});
+
+// 30. THREADS - ADD THREADED COMMENT
+app.post('/comments/:parentId/reply', authenticate, async (req, res) => {
+  const { parentId } = req.params;
+  const { content, postId } = req.body;
+  const userId = req.user.id;
+  const userRole = req.user.role;
+  
+  if (userRole === 'VIEW_ONLY') {
+    return res.status(403).json({ error: 'View-Only users cannot comment' });
+  }
+  
+  if (!content) {
+    return res.status(400).json({ error: 'Comment content is required' });
+  }
+  
+  try {
+    const commentResult = await pool.query(`
+      INSERT INTO comments (post_id, user_id, content)
+      VALUES ($1, $2, $3)
+      RETURNING id, content, created_at
+    `, [postId, userId, content]);
+    
+    const commentId = commentResult.rows[0].id;
+    
+    await pool.query(`
+      INSERT INTO comment_threads (parent_comment_id, comment_id)
+      VALUES ($1, $2)
+    `, [parentId, commentId]);
+    
+    res.json({ ...commentResult.rows[0], parent_comment_id: parentId });
+  } catch (err) {
+    console.error(`[THREAD REPLY] Error:`, err.message);
+    res.status(500).json({ error: 'Could not create thread reply' });
+  }
+});
+
+// 31. THREADS - GET THREAD REPLIES
+app.get('/comments/:parentId/replies', async (req, res) => {
+  const { parentId } = req.params;
+  
+  try {
+    const result = await pool.query(`
+      SELECT c.id, c.content, c.created_at,
+             u.id as user_id, u.username, u.avatar_url
+      FROM comment_threads ct
+      JOIN comments c ON ct.comment_id = c.id
+      JOIN users u ON c.user_id = u.id
+      WHERE ct.parent_comment_id = $1
+      ORDER BY c.created_at ASC
+    `, [parentId]);
+    
+    res.json(result.rows);
+  } catch (err) {
+    console.error(`[THREAD REPLIES] Error:`, err.message);
+    res.status(500).json({ error: 'Could not fetch thread replies' });
+  }
+});
+
+// 32. FOLLOW/UNFOLLOW USER
+app.post('/users/:id/follow', authenticate, async (req, res) => {
+  const { id: targetUserId } = req.params;
+  const userId = req.user.id;
+  
+  if (targetUserId === userId) {
+    return res.status(400).json({ error: 'Cannot follow yourself' });
+  }
+  
+  try {
+    const existing = await pool.query(
+      'SELECT * FROM follows WHERE follower_id = $1 AND following_id = $2',
+      [userId, targetUserId]
+    );
+    
+    if (existing.rows.length > 0) {
+      await pool.query(
+        'DELETE FROM follows WHERE follower_id = $1 AND following_id = $2',
+        [userId, targetUserId]
+      );
+      res.json({ following: false });
+    } else {
+      await pool.query(
+        'INSERT INTO follows (follower_id, following_id) VALUES ($1, $2)',
+        [userId, targetUserId]
+      );
+      res.json({ following: true });
+    }
+  } catch (err) {
+    console.error(`[FOLLOW] Error:`, err.message);
+    res.status(500).json({ error: 'Could not follow/unfollow user' });
+  }
+});
+
+// 33. MODERATOR - DELETE ANY POST
+app.delete('/admin/posts/:id', authenticate, async (req, res) => {
+  const { id: postId } = req.params;
+  const userRole = req.user.role;
+  
+  if (userRole !== 'MODERATOR' && userRole !== 'ADMIN') {
+    return res.status(403).json({ error: 'Only moderators can delete posts' });
+  }
+  
+  try {
+    await pool.query('DELETE FROM posts WHERE id = $1', [postId]);
+    res.json({ success: true });
+  } catch (err) {
+    console.error(`[MODERATOR DELETE] Error:`, err.message);
+    res.status(500).json({ error: 'Could not delete post' });
+  }
+});
+
+// 34. MODERATOR - GET PENDING VERIFICATIONS
+app.get('/admin/pending-verifications', authenticate, async (req, res) => {
+  const userRole = req.user.role;
+  
+  if (userRole !== 'MODERATOR' && userRole !== 'ADMIN') {
+    return res.status(403).json({ error: 'Only moderators can view pending verifications' });
+  }
+  
+  try {
+    const result = await pool.query(`
+      SELECT id, username, email, phone, full_name, npi_number, state_license, 
+             verification_code, user_type, created_at
+      FROM users
+      WHERE verified = FALSE AND verification_code IS NOT NULL
+      ORDER BY created_at DESC
+    `);
+    
+    res.json(result.rows);
+  } catch (err) {
+    console.error(`[PENDING VERIFICATIONS] Error:`, err.message);
+    res.status(500).json({ error: 'Could not fetch pending verifications' });
+  }
+});
+
 // 18. VERIFY USER (Moderator only - verify NPI/State License)
 app.post('/admin/verify-user/:id', authenticate, async (req, res) => {
   const { id: userId } = req.params;
   const { verificationCode } = req.body;
   
   // Only moderators can verify users
-  if (req.user.role !== 'MODERATOR') {
+  if (req.user.role !== 'MODERATOR' && req.user.role !== 'ADMIN') {
     return res.status(403).json({ error: 'Only moderators can verify users' });
   }
   
@@ -1533,6 +1936,50 @@ const initDb = async () => {
                 to_user_id UUID REFERENCES users(id),
                 is_external BOOLEAN DEFAULT FALSE,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS conversations (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                user1_id UUID REFERENCES users(id),
+                user2_id UUID REFERENCES users(id),
+                last_message_at TIMESTAMP,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(user1_id, user2_id)
+            );
+            CREATE TABLE IF NOT EXISTS messages (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                conversation_id UUID REFERENCES conversations(id) ON DELETE CASCADE,
+                sender_id UUID REFERENCES users(id),
+                content TEXT,
+                media_url TEXT,
+                is_read BOOLEAN DEFAULT FALSE,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS stories (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                user_id UUID REFERENCES users(id),
+                media_url TEXT NOT NULL,
+                media_type VARCHAR(10) NOT NULL,
+                expires_at TIMESTAMP NOT NULL,
+                views_count INTEGER DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS story_views (
+                story_id UUID REFERENCES stories(id) ON DELETE CASCADE,
+                viewer_id UUID REFERENCES users(id),
+                viewed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (story_id, viewer_id)
+            );
+            CREATE TABLE IF NOT EXISTS comment_threads (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                parent_comment_id UUID REFERENCES comments(id) ON DELETE CASCADE,
+                comment_id UUID REFERENCES comments(id) ON DELETE CASCADE,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS follows (
+                follower_id UUID REFERENCES users(id),
+                following_id UUID REFERENCES users(id),
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (follower_id, following_id)
             );
             CREATE TABLE IF NOT EXISTS follows (
                 follower_id UUID REFERENCES users(id) ON DELETE CASCADE,
