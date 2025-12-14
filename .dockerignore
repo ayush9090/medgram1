@@ -1,0 +1,19 @@
+# Backend files (not needed for frontend build)
+backend/
+node_modules/
+.git/
+.gitignore
+
+# Docker files
+docker-compose.yml
+Dockerfile
+*.md
+
+# Environment files (will be handled separately if needed)
+.env
+.env.local
+
+# Build outputs
+dist/
+build/
+

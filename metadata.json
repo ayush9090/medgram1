@@ -1,0 +1,8 @@
+{
+  "name": "Copy of MedGram",
+  "description": "A secure, role-based social platform for medical professionals with short-form video and threaded discussions.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone"
+  ]
+}
