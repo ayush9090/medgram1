@@ -107,6 +107,9 @@ services:
       PORT: 4000
       # Points to your server IP so devices can access media
       MINIO_PUBLIC_URL: http://74.208.158.126:9000
+      # MinIO public endpoint for presigned URLs (must be accessible from browser)
+      MINIO_PUBLIC_ENDPOINT: 74.208.158.126
+      MINIO_PUBLIC_PORT: 9000
       # Email Configuration (configure these for email authentication)
       # For Gmail: Use App Password (NOT regular password)
       # Get App Password: https://myaccount.google.com/apppasswords
@@ -191,3 +194,4 @@ volumes:
   postgres_data:
   minio_data:
   pgadmin_data:
+
