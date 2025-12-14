@@ -206,9 +206,25 @@ const pool = new Pool({
 
 // --- MINIO CONNECTION ---
 // Connects to the 'medgram_storage' container from your stack (Internal Docker Network)
+// For presigned URLs, we need to use the public URL
+const MINIO_INTERNAL_ENDPOINT = process.env.MINIO_ENDPOINT || 'medgram_storage';
+const MINIO_INTERNAL_PORT = parseInt(process.env.MINIO_PORT || '9000');
+const MINIO_PUBLIC_ENDPOINT = process.env.MINIO_PUBLIC_ENDPOINT || '74.208.158.126'; // Public IP or domain
+const MINIO_PUBLIC_PORT = parseInt(process.env.MINIO_PUBLIC_PORT || '9000');
+
+// Internal client for operations (bucket creation, etc.)
 const minioClient = new Minio.Client({
-  endPoint: process.env.MINIO_ENDPOINT || 'medgram_storage',
-  port: parseInt(process.env.MINIO_PORT || '9000'),
+  endPoint: MINIO_INTERNAL_ENDPOINT,
+  port: MINIO_INTERNAL_PORT,
+  useSSL: false,
+  accessKey: process.env.MINIO_ROOT_USER || 'minio_admin',
+  secretKey: process.env.MINIO_ROOT_PASSWORD || 'secure_minio_password_change_me',
+});
+
+// Public client for presigned URLs (uses public endpoint)
+const minioPublicClient = new Minio.Client({
+  endPoint: MINIO_PUBLIC_ENDPOINT,
+  port: MINIO_PUBLIC_PORT,
   useSSL: false,
   accessKey: process.env.MINIO_ROOT_USER || 'minio_admin',
   secretKey: process.env.MINIO_ROOT_PASSWORD || 'secure_minio_password_change_me',
@@ -803,15 +819,29 @@ app.post('/upload/presigned', authenticate, async (req, res) => {
   const objectName = `${req.user.id}/${Date.now()}-${Math.random().toString(36).substring(7)}.${fileExtension}`;
   
   try {
-    // Ensure bucket exists
+    // Ensure bucket exists using internal client
     const bucketExists = await minioClient.bucketExists(bucket);
     if (!bucketExists) {
       await minioClient.makeBucket(bucket, 'us-east-1');
+      // Set bucket policy to public read
+      try {
+        await minioClient.setBucketPolicy(bucket, JSON.stringify({
+          Version: '2012-10-17',
+          Statement: [{
+            Effect: 'Allow',
+            Principal: { AWS: ['*'] },
+            Action: ['s3:GetObject'],
+            Resource: [`arn:aws:s3:::${bucket}/*`]
+          }]
+        }));
+      } catch (policyErr) {
+        console.log(`[PRESIGNED URL] Note: Could not set bucket policy (may need manual setup)`);
+      }
       console.log(`[PRESIGNED URL] Created bucket: ${bucket}`);
     }
     
-    // Generate presigned URL with dynamic expiry
-    const url = await minioClient.presignedPutObject(bucket, objectName, PRESIGNED_URL_EXPIRY);
+    // Generate presigned URL using public client (so browser can access it)
+    const url = await minioPublicClient.presignedPutObject(bucket, objectName, PRESIGNED_URL_EXPIRY);
     const publicUrl = `${MINIO_PUBLIC_URL}/${bucket}/${objectName}`;
     
     console.log(`[PRESIGNED URL] Generated URL for object: ${objectName} in bucket: ${bucket}`);
