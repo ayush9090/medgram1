@@ -747,6 +747,9 @@ app.get('/feed', async (req, res) => {
   console.log(`[FEED] Fetching feed - page: ${page}, limit: ${limit}, type: ${type || 'all'}, userId: ${userId || 'all'}, currentUser: ${currentUserId || 'anonymous'}`);
   
   try {
+    const params = [];
+    let paramCount = 1;
+    
     // Base query with privacy filtering
     let query = `
       SELECT 
@@ -755,7 +758,7 @@ app.get('/feed', async (req, res) => {
         u.id as "authorId", COALESCE(u.full_name, u.username) as "authorName", u.avatar_url as "authorAvatar", u.role as "authorRole",
         u.account_privacy,
         (SELECT COUNT(*) FROM likes WHERE post_id = p.id) as likes,
-        (SELECT COUNT(*) FROM comments WHERE post_id = p.id) as commentCount
+        (SELECT COUNT(*) FROM comments WHERE post_id = p.id AND parent_comment_id IS NULL) as commentCount
       FROM posts p
       JOIN users u ON p.user_id = u.id
       WHERE (p.processing_status = 'COMPLETED' OR p.processing_status IS NULL OR p.processing_status = 'PENDING')
@@ -765,11 +768,11 @@ app.get('/feed', async (req, res) => {
     if (currentUserId) {
       query += ` AND (
         u.account_privacy = 'PUBLIC' 
-        OR u.id = $${paramCount + 1}
+        OR u.id = $${paramCount}
         OR EXISTS (
           SELECT 1 FROM follows f 
           WHERE f.following_id = u.id 
-            AND f.follower_id = $${paramCount + 1}
+            AND f.follower_id = $${paramCount}
         )
       )`;
       params.push(currentUserId);
@@ -779,15 +782,14 @@ app.get('/feed', async (req, res) => {
       query += ` AND u.account_privacy = 'PUBLIC'`;
     }
     
-    const params = [];
-    let paramCount = 1;
-    
+    // Filter by type
     if (type) {
       query += ` AND p.type = $${paramCount}`;
       params.push(type);
       paramCount++;
     }
     
+    // Filter by user
     if (userId) {
       query += ` AND p.user_id = $${paramCount}`;
       params.push(userId);
@@ -797,33 +799,16 @@ app.get('/feed', async (req, res) => {
     query += ` ORDER BY p.created_at DESC LIMIT $${paramCount} OFFSET $${paramCount + 1}`;
     params.push(limit, offset);
     
-    // Get total count for pagination
-    const countQuery = `
-      SELECT COUNT(*) as total
-      FROM posts p
-      WHERE (p.processing_status = 'COMPLETED' OR p.processing_status IS NULL OR p.processing_status = 'PENDING')
-      ${type ? `AND p.type = '${type}'` : ''}
-      ${userId ? `AND p.user_id = '${userId}'` : ''}
-    `;
-    
-    const [result, countResult] = await Promise.all([
-      pool.query(query, params),
-      pool.query(countQuery, countParams)
-    ]);
-    
-    const total = parseInt(countResult.rows[0].total);
-    const totalPages = Math.ceil(total / limit);
+    // Get total count for pagination (simplified - just get result count)
+    const result = await pool.query(query, params);
     
     // Check if user liked each post (if authenticated)
-    const userIdForLikes = req.headers.authorization ? 
-      (await jwt.verify(req.headers.authorization.split(' ')[1], JWT_SECRET))?.id : null;
-    
     const posts = await Promise.all(result.rows.map(async (row) => {
       let likedByCurrentUser = false;
-      if (userIdForLikes) {
+      if (currentUserId) {
         const likeCheck = await pool.query(
           'SELECT 1 FROM likes WHERE user_id = $1 AND post_id = $2',
-          [userIdForLikes, row.id]
+          [currentUserId, row.id]
         );
         likedByCurrentUser = likeCheck.rows.length > 0;
       }
@@ -836,16 +821,13 @@ app.get('/feed', async (req, res) => {
       };
     }));
     
-    console.log(`[FEED] Returning ${posts.length} posts (page ${page}/${totalPages}, total: ${total})`);
+    console.log(`[FEED] Returning ${posts.length} posts`);
     res.json({
       posts,
       pagination: {
         page,
         limit,
-        total,
-        totalPages,
-        hasNext: page < totalPages,
-        hasPrev: page > 1
+        hasMore: posts.length >= limit
       }
     });
   } catch (err) {
@@ -3161,7 +3143,7 @@ app.get('/activity', authenticate, async (req, res) => {
       ORDER BY l.created_at DESC
     `, [userId]);
     
-    // Get comments on user's posts
+    // Get comments on user's posts (only top-level comments, not replies)
     const commentsQuery = await pool.query(`
       SELECT 
         c.created_at as timestamp,
@@ -3178,7 +3160,7 @@ app.get('/activity', authenticate, async (req, res) => {
       FROM comments c
       JOIN users u ON c.user_id = u.id
       JOIN posts p ON c.post_id = p.id
-      WHERE p.user_id = $1
+      WHERE p.user_id = $1 AND (c.parent_comment_id IS NULL)
       ORDER BY c.created_at DESC
     `, [userId]);
     
