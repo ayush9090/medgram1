@@ -3556,6 +3556,11 @@ const initDb = async () => {
             CREATE INDEX IF NOT EXISTS idx_blocks_blocker ON blocks(blocker_id);
             CREATE INDEX IF NOT EXISTS idx_blocks_blocked ON blocks(blocked_id);
             
+            -- Backfill older schemas: ensure likes.created_at exists
+            ALTER TABLE likes ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
+            -- Backfill older schemas: ensure comments.updated_at exists
+            ALTER TABLE comments ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
+            
             -- Comments table backfill (if older schema)
             ALTER TABLE comments ADD COLUMN IF NOT EXISTS parent_comment_id UUID REFERENCES comments(id) ON DELETE CASCADE;
             ALTER TABLE comments ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
