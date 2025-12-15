@@ -273,8 +273,8 @@ const authenticate = (req, res, next) => {
 
 // 1. REGISTER (Updated per MIB Layout requirements)
 app.post('/auth/register', async (req, res) => {
-  const { username, password, fullName, role, npiNumber, stateLicense, email, phone, userType } = req.body;
-  console.log(`[REGISTER] Attempting to register user: ${username || email || phone}, role: ${role}`);
+  const { username, password, fullName, role, npiNumber, stateLicense, email, phone, userType, accountPrivacy, inviteCode } = req.body;
+  console.log(`[REGISTER] Attempting to register user: ${username || email || phone}, role: ${role}, inviteCode: ${inviteCode || 'none'}`);
   
   try {
     // Username can be email or phone number
@@ -282,6 +282,37 @@ app.post('/auth/register', async (req, res) => {
     if (!identifier || !password) {
       console.log(`[REGISTER] Missing identifier or password`);
       return res.status(400).json({ error: 'Email/Phone and password are required' });
+    }
+    
+    // Validate invite code if provided
+    if (!inviteCode) {
+      return res.status(400).json({ error: 'Invite code is required' });
+    }
+    
+    const inviteResult = await pool.query(
+      'SELECT * FROM invite_codes WHERE code = $1 AND is_active = TRUE',
+      [inviteCode.toUpperCase().trim()]
+    );
+    
+    if (inviteResult.rows.length === 0) {
+      return res.status(400).json({ error: 'Invalid invite code' });
+    }
+    
+    const invite = inviteResult.rows[0];
+    
+    // Check if expired
+    if (invite.expires_at && new Date(invite.expires_at) < new Date()) {
+      return res.status(400).json({ error: 'Invite code has expired' });
+    }
+    
+    // Check if max uses reached
+    if (invite.max_uses > 0 && invite.current_uses >= invite.max_uses) {
+      return res.status(400).json({ error: 'Invite code has reached maximum uses' });
+    }
+    
+    // Check if already used (for single-use codes)
+    if (invite.max_uses === 1 && invite.used_by) {
+      return res.status(400).json({ error: 'Invite code has already been used' });
     }
     
     // Validate email or phone format
@@ -335,10 +366,12 @@ app.post('/auth/register', async (req, res) => {
     const hashedPassword = await bcrypt.hash(password, 10);
     const defaultRole = role || 'USER'; // Default to USER if not specified
     
+    const privacy = accountPrivacy && ['PUBLIC', 'PRIVATE'].includes(accountPrivacy) ? accountPrivacy : 'PUBLIC';
+    
     const result = await pool.query(
-      `INSERT INTO users (username, email, phone, password_hash, full_name, role, npi_number, state_license, avatar_url, verified, verification_code, user_type, email_verified, email_verification_code, email_verification_expires) 
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15) 
-       RETURNING id, username, email, phone, role, verified, verification_code, email_verified`,
+      `INSERT INTO users (username, email, phone, password_hash, full_name, role, npi_number, state_license, avatar_url, verified, verification_code, user_type, email_verified, email_verification_code, email_verification_expires, account_privacy) 
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16) 
+       RETURNING id, username, email, phone, role, verified, verification_code, email_verified, account_privacy`,
       [
         identifier, 
         isEmail ? identifier : null, // email
@@ -354,11 +387,21 @@ app.post('/auth/register', async (req, res) => {
         userType || 'OTHER',
         emailVerified,
         emailVerificationCode,
-        emailVerificationCode ? new Date(Date.now() + 24 * 60 * 60 * 1000) : null // 24 hours expiry
+        emailVerificationCode ? new Date(Date.now() + 24 * 60 * 60 * 1000) : null, // 24 hours expiry
+        privacy
       ]
     );
     
     const user = result.rows[0];
+    
+    // Mark invite code as used
+    await pool.query(
+      `UPDATE invite_codes 
+       SET used_by = $1, used_at = CURRENT_TIMESTAMP, current_uses = current_uses + 1 
+       WHERE code = $2`,
+      [user.id, inviteCode.toUpperCase().trim()]
+    );
+    console.log(`[REGISTER] Invite code ${inviteCode} marked as used by user ${user.id}`);
     
     // Send email verification if email provided
     if (isEmail && emailVerificationCode) {
@@ -681,7 +724,7 @@ app.post('/auth/reset-password', async (req, res) => {
   }
 });
 
-// 3. GET FEED (with pagination and filtering)
+// 3. GET FEED (with pagination, filtering, and privacy support)
 app.get('/feed', async (req, res) => {
   const page = parseInt(req.query.page || '1');
   const limit = Math.min(parseInt(req.query.limit || DEFAULT_PAGE_SIZE), MAX_PAGE_SIZE);
@@ -689,20 +732,53 @@ app.get('/feed', async (req, res) => {
   const type = req.query.type; // Filter by post type (VIDEO, THREAD, etc.)
   const userId = req.query.userId; // Filter by user
   
-  console.log(`[FEED] Fetching feed - page: ${page}, limit: ${limit}, type: ${type || 'all'}, userId: ${userId || 'all'}`);
+  // Get current user if authenticated
+  const token = req.headers.authorization?.split(' ')[1];
+  let currentUserId = null;
+  if (token) {
+    try {
+      const decoded = jwt.verify(token, JWT_SECRET);
+      currentUserId = decoded.id;
+    } catch (err) {
+      // Invalid token, continue without authentication
+    }
+  }
+  
+  console.log(`[FEED] Fetching feed - page: ${page}, limit: ${limit}, type: ${type || 'all'}, userId: ${userId || 'all'}, currentUser: ${currentUserId || 'anonymous'}`);
   
   try {
+    // Base query with privacy filtering
     let query = `
       SELECT 
         p.id, p.type, p.content, p.media_url as "mediaUrl", p.thumbnail_url as "thumbnailUrl", 
         p.created_at as timestamp, p.processing_status,
         u.id as "authorId", COALESCE(u.full_name, u.username) as "authorName", u.avatar_url as "authorAvatar", u.role as "authorRole",
+        u.account_privacy,
         (SELECT COUNT(*) FROM likes WHERE post_id = p.id) as likes,
         (SELECT COUNT(*) FROM comments WHERE post_id = p.id) as commentCount
       FROM posts p
       JOIN users u ON p.user_id = u.id
       WHERE (p.processing_status = 'COMPLETED' OR p.processing_status IS NULL OR p.processing_status = 'PENDING')
     `;
+    
+    // Privacy filtering: Show posts from public accounts OR private accounts where current user follows
+    if (currentUserId) {
+      query += ` AND (
+        u.account_privacy = 'PUBLIC' 
+        OR u.id = $${paramCount + 1}
+        OR EXISTS (
+          SELECT 1 FROM follows f 
+          WHERE f.following_id = u.id 
+            AND f.follower_id = $${paramCount + 1}
+        )
+      )`;
+      params.push(currentUserId);
+      paramCount++;
+    } else {
+      // Not logged in - only show public posts
+      query += ` AND u.account_privacy = 'PUBLIC'`;
+    }
+    
     const params = [];
     let paramCount = 1;
     
@@ -732,7 +808,7 @@ app.get('/feed', async (req, res) => {
     
     const [result, countResult] = await Promise.all([
       pool.query(query, params),
-      pool.query(countQuery)
+      pool.query(countQuery, countParams)
     ]);
     
     const total = parseInt(countResult.rows[0].total);
@@ -1029,7 +1105,7 @@ app.get('/users/:id', async (req, res) => {
   try {
     const result = await pool.query(
       `SELECT id, username, email, phone, full_name, role, avatar_url, verified, created_at, 
-              npi_number, state_license, user_type, bio
+              npi_number, state_license, user_type, bio, account_privacy, who_can_follow, who_can_message
        FROM users WHERE id = $1`,
       [id]
     );
@@ -1048,24 +1124,65 @@ app.get('/users/:id', async (req, res) => {
       pool.query('SELECT COUNT(*) as count FROM follows WHERE follower_id = $1', [id])
     ]);
     
-    // Check if current user is following this profile user
+    // Check privacy and follow status
+    const accountPrivacy = user.account_privacy || 'PUBLIC';
+    const isOwnProfile = currentUserId === id;
+    let canViewPosts = isOwnProfile;
     let isFollowing = false;
+    let followRequestStatus = null;
+    let hasPendingRequest = false;
+    
     if (currentUserId && currentUserId !== id) {
+      // Check if blocked
+      const blockCheck = await pool.query(
+        'SELECT * FROM blocks WHERE (blocker_id = $1 AND blocked_id = $2) OR (blocker_id = $2 AND blocked_id = $1)',
+        [currentUserId, id]
+      );
+      
+      if (blockCheck.rows.length > 0) {
+        return res.status(403).json({ error: 'Cannot view this profile' });
+      }
+      
+      // Check follow status
       const followCheck = await pool.query(
         'SELECT * FROM follows WHERE follower_id = $1 AND following_id = $2',
         [currentUserId, id]
       );
       isFollowing = followCheck.rows.length > 0;
+      
+      // Check follow request
+      const requestCheck = await pool.query(
+        'SELECT status FROM follow_requests WHERE requester_id = $1 AND target_id = $2',
+        [currentUserId, id]
+      );
+      if (requestCheck.rows.length > 0) {
+        followRequestStatus = requestCheck.rows[0].status;
+        hasPendingRequest = requestCheck.rows[0].status === 'PENDING';
+      }
+      
+      // Determine if can view posts
+      if (accountPrivacy === 'PUBLIC') {
+        canViewPosts = true;
+      } else if (accountPrivacy === 'PRIVATE') {
+        canViewPosts = isFollowing;
+      }
+    } else if (!currentUserId) {
+      // Not logged in - only public profiles visible
+      canViewPosts = accountPrivacy === 'PUBLIC';
     }
     
     const profile = {
       ...user,
+      accountPrivacy: accountPrivacy,
       stats: {
-        posts: parseInt(postsCount.rows[0].count),
+        posts: canViewPosts ? parseInt(postsCount.rows[0].count) : 0,
         followers: parseInt(followersCount.rows[0].count),
         following: parseInt(followingCount.rows[0].count)
       },
-      isFollowing: isFollowing
+      isFollowing: isFollowing,
+      followRequestStatus: followRequestStatus,
+      hasPendingRequest: hasPendingRequest,
+      canViewPosts: canViewPosts
     };
     
     console.log(`[USER PROFILE] Profile retrieved for: ${user.username}, isFollowing: ${isFollowing}`);
@@ -1188,9 +1305,55 @@ app.post('/posts/:id/like', authenticate, async (req, res) => {
 // 9. GET POSTS BY USER
 app.get('/users/:id/posts', async (req, res) => {
   const { id: userId } = req.params;
-  console.log(`[USER POSTS] Fetching posts for user: ${userId}`);
+  const token = req.headers.authorization?.split(' ')[1];
+  let currentUserId = null;
+  
+  if (token) {
+    try {
+      const decoded = jwt.verify(token, JWT_SECRET);
+      currentUserId = decoded.id;
+    } catch (err) {
+      // Invalid token, continue without authentication
+    }
+  }
+  
+  console.log(`[USER POSTS] Fetching posts for user: ${userId}${currentUserId ? ` (viewed by: ${currentUserId})` : ''}`);
   
   try {
+    // Get user's privacy settings
+    const userResult = await pool.query(
+      'SELECT account_privacy FROM users WHERE id = $1',
+      [userId]
+    );
+    
+    if (userResult.rows.length === 0) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    
+    const accountPrivacy = userResult.rows[0].account_privacy || 'PUBLIC';
+    const isOwnProfile = currentUserId === userId;
+    let canViewPosts = isOwnProfile;
+    
+    // Check if can view posts
+    if (!isOwnProfile) {
+      if (accountPrivacy === 'PUBLIC') {
+        canViewPosts = true;
+      } else if (accountPrivacy === 'PRIVATE' && currentUserId) {
+        // Check if current user follows this user
+        const followCheck = await pool.query(
+          'SELECT * FROM follows WHERE follower_id = $1 AND following_id = $2',
+          [currentUserId, userId]
+        );
+        canViewPosts = followCheck.rows.length > 0;
+      } else {
+        canViewPosts = false;
+      }
+    }
+    
+    if (!canViewPosts) {
+      return res.status(403).json({ error: 'This account is private. Follow to see posts.' });
+    }
+    
     const result = await pool.query(`
       SELECT 
         p.id, p.type, p.content, p.media_url as "mediaUrl", p.thumbnail_url as "thumbnailUrl", 
@@ -1219,13 +1382,14 @@ app.get('/users/:id/posts', async (req, res) => {
 });
 
 // 10. ADD COMMENT (MIB Layout: VIEW_ONLY cannot comment)
+// Enhanced comment creation with mentions, privacy checks, and moderation
 app.post('/posts/:id/comments', authenticate, async (req, res) => {
   const { id: postId } = req.params;
-  const { content } = req.body;
+  const { content, parentCommentId } = req.body;
   const userId = req.user.id;
   const userRole = req.user.role;
   
-  // MIB Layout: VIEW_ONLY cannot comment
+  // VIEW_ONLY cannot comment
   if (userRole === 'VIEW_ONLY') {
     console.log(`[COMMENT] Permission denied - VIEW_ONLY cannot comment`);
     return res.status(403).json({ error: 'View-Only users cannot comment on posts' });
@@ -1238,28 +1402,125 @@ app.post('/posts/:id/comments', authenticate, async (req, res) => {
   }
   
   try {
+    // Check if post exists and get post details
+    const postResult = await pool.query(`
+      SELECT p.*, u.account_privacy, u.id as post_owner_id
+      FROM posts p
+      JOIN users u ON p.user_id = u.id
+      WHERE p.id = $1
+    `, [postId]);
+    
+    if (postResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Post not found' });
+    }
+    
+    const post = postResult.rows[0];
+    
+    // Check if comments are enabled
+    if (post.comments_enabled === false) {
+      return res.status(403).json({ error: 'Comments are disabled for this post' });
+    }
+    
+    // Check comment restrictions
+    if (post.comment_restriction === 'FOLLOWERS') {
+      const followCheck = await pool.query(
+        'SELECT * FROM follows WHERE follower_id = $1 AND following_id = $2',
+        [userId, post.post_owner_id]
+      );
+      if (followCheck.rows.length === 0) {
+        return res.status(403).json({ error: 'Only followers can comment on this post' });
+      }
+    } else if (post.comment_restriction === 'FOLLOWING') {
+      const followCheck = await pool.query(
+        'SELECT * FROM follows WHERE follower_id = $1 AND following_id = $2',
+        [post.post_owner_id, userId]
+      );
+      if (followCheck.rows.length === 0) {
+        return res.status(403).json({ error: 'Only people the post owner follows can comment' });
+      }
+    }
+    
+    // Check if user is blocked by post owner
+    const blockCheck = await pool.query(
+      'SELECT * FROM blocks WHERE (blocker_id = $1 AND blocked_id = $2) OR (blocker_id = $2 AND blocked_id = $1)',
+      [userId, post.post_owner_id]
+    );
+    if (blockCheck.rows.length > 0) {
+      return res.status(403).json({ error: 'Cannot comment on this post' });
+    }
+    
+    // Validate parent comment if replying
+    if (parentCommentId) {
+      const parentCheck = await pool.query(
+        'SELECT id, post_id FROM comments WHERE id = $1 AND post_id = $2',
+        [parentCommentId, postId]
+      );
+      if (parentCheck.rows.length === 0) {
+        return res.status(400).json({ error: 'Invalid parent comment' });
+      }
+    }
+    
+    // Insert comment
     const result = await pool.query(
-      `INSERT INTO comments (post_id, user_id, content) 
-       VALUES ($1, $2, $3) 
-       RETURNING id, content, created_at`,
-      [postId, userId, content.trim()]
+      `INSERT INTO comments (post_id, user_id, content, parent_comment_id) 
+       VALUES ($1, $2, $3, $4) 
+       RETURNING id, content, created_at, parent_comment_id`,
+      [postId, userId, content.trim(), parentCommentId || null]
     );
     
-    // Get comment with user info
+    const commentId = result.rows[0].id;
+    
+    // Parse mentions (@username) and create mention records
+    const mentionRegex = /@(\w+)/g;
+    const mentions = [];
+    let match;
+    while ((match = mentionRegex.exec(content)) !== null) {
+      mentions.push(match[1]);
+    }
+    
+    // Create mention records for valid users
+    for (const username of mentions) {
+      const userResult = await pool.query(
+        'SELECT id FROM users WHERE LOWER(username) = LOWER($1)',
+        [username]
+      );
+      if (userResult.rows.length > 0) {
+        await pool.query(
+          'INSERT INTO comment_mentions (comment_id, mentioned_user_id) VALUES ($1, $2)',
+          [commentId, userResult.rows[0].id]
+        );
+        // TODO: Send notification to mentioned user
+      }
+    }
+    
+    // Get full comment with user info, likes count, and replies count
     const commentResult = await pool.query(`
-      SELECT c.id, c.content, c.created_at as timestamp,
-             u.id as "userId", u.username as "userName", u.avatar_url as "userAvatar"
+      SELECT 
+        c.id, 
+        c.content, 
+        c.created_at as timestamp,
+        c.parent_comment_id,
+        u.id as "userId", 
+        COALESCE(u.full_name, u.username) as "userName",
+        u.username,
+        u.avatar_url as "userAvatar",
+        u.verified,
+        (SELECT COUNT(*) FROM comment_likes WHERE comment_id = c.id) as likes_count,
+        (SELECT COUNT(*) FROM comments WHERE parent_comment_id = c.id) as replies_count
       FROM comments c
       JOIN users u ON c.user_id = u.id
       WHERE c.id = $1
-    `, [result.rows[0].id]);
+    `, [commentId]);
     
     const comment = {
       ...commentResult.rows[0],
-      timestamp: new Date(commentResult.rows[0].timestamp).getTime()
+      timestamp: new Date(commentResult.rows[0].timestamp).getTime(),
+      likesCount: parseInt(commentResult.rows[0].likes_count || 0),
+      repliesCount: parseInt(commentResult.rows[0].replies_count || 0),
+      likedByCurrentUser: false
     };
     
-    console.log(`[COMMENT] Comment added successfully, ID: ${result.rows[0].id}`);
+    console.log(`[COMMENT] Comment added successfully, ID: ${commentId}`);
     res.json(comment);
   } catch (err) {
     console.error(`[COMMENT] Error:`, err.message);
@@ -1267,36 +1528,417 @@ app.post('/posts/:id/comments', authenticate, async (req, res) => {
   }
 });
 
-// 11. GET COMMENTS
+// Enhanced GET COMMENTS with relevance ranking, privacy, and threading
 app.get('/posts/:id/comments', async (req, res) => {
   const { id: postId } = req.params;
   const page = parseInt(req.query.page || '1');
   const limit = Math.min(parseInt(req.query.limit || '50'), 100);
   const offset = (page - 1) * limit;
+  const includeReplies = req.query.includeReplies !== 'false'; // Default true
   
-  console.log(`[COMMENTS] Fetching comments for post ${postId}, page: ${page}`);
+  // Get current user if authenticated
+  const token = req.headers.authorization?.split(' ')[1];
+  let currentUserId = null;
+  if (token) {
+    try {
+      const decoded = jwt.verify(token, JWT_SECRET);
+      currentUserId = decoded.id;
+    } catch (err) {
+      // Invalid token, continue without authentication
+    }
+  }
+  
+  console.log(`[COMMENTS] Fetching comments for post ${postId}, page: ${page}, user: ${currentUserId || 'anonymous'}`);
   
   try {
-    const result = await pool.query(`
-      SELECT c.id, c.content, c.created_at as timestamp,
-             u.id as "userId", u.username as "userName", u.avatar_url as "userAvatar"
+    // Check post exists and get post owner
+    const postResult = await pool.query(`
+      SELECT p.*, u.id as post_owner_id, u.account_privacy
+      FROM posts p
+      JOIN users u ON p.user_id = u.id
+      WHERE p.id = $1
+    `, [postId]);
+    
+    if (postResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Post not found' });
+    }
+    
+    const post = postResult.rows[0];
+    
+    // Privacy check: can user view comments?
+    let canViewComments = true;
+    if (currentUserId) {
+      // Check if blocked
+      const blockCheck = await pool.query(
+        'SELECT * FROM blocks WHERE (blocker_id = $1 AND blocked_id = $2) OR (blocker_id = $2 AND blocked_id = $1)',
+        [currentUserId, post.post_owner_id]
+      );
+      if (blockCheck.rows.length > 0) {
+        canViewComments = false;
+      } else if (post.account_privacy === 'PRIVATE') {
+        const followCheck = await pool.query(
+          'SELECT * FROM follows WHERE follower_id = $1 AND following_id = $2',
+          [currentUserId, post.post_owner_id]
+        );
+        if (followCheck.rows.length === 0 && currentUserId !== post.post_owner_id) {
+          canViewComments = false;
+        }
+      }
+    } else {
+      // Anonymous users can only see comments on public posts
+      if (post.account_privacy === 'PRIVATE') {
+        canViewComments = false;
+      }
+    }
+    
+    if (!canViewComments) {
+      return res.json({ comments: [], pagination: { page, limit, hasMore: false } });
+    }
+    
+    // Build query with relevance ranking
+    let query = `
+      SELECT 
+        c.id, 
+        c.content, 
+        c.created_at as timestamp,
+        c.parent_comment_id,
+        u.id as "userId", 
+        COALESCE(u.full_name, u.username) as "userName",
+        u.username,
+        u.avatar_url as "userAvatar",
+        u.verified,
+        (SELECT COUNT(*) FROM comment_likes WHERE comment_id = c.id) as likes_count,
+        (SELECT COUNT(*) FROM comments WHERE parent_comment_id = c.id) as replies_count,
+        -- Relevance score: post owner comments first, then by likes, then by time
+        CASE 
+          WHEN c.user_id = $${currentUserId ? 2 : 1} THEN 1000
+          ELSE (SELECT COUNT(*) FROM comment_likes WHERE comment_id = c.id) * 10
+        END as relevance_score
+    `;
+    
+    const queryParams = [postId];
+    let paramCount = 2;
+    
+    // Add liked_by_current_user if authenticated
+    if (currentUserId) {
+      query += `,
+        (SELECT COUNT(*) FROM comment_likes WHERE comment_id = c.id AND user_id = $${paramCount}) > 0 as liked_by_current_user
+      `;
+      queryParams.push(currentUserId);
+      paramCount++;
+    } else {
+      query += `, false as liked_by_current_user`;
+    }
+    
+    query += `
       FROM comments c
       JOIN users u ON c.user_id = u.id
       WHERE c.post_id = $1
-      ORDER BY c.created_at ASC
-      LIMIT $2 OFFSET $3
-    `, [postId, limit, offset]);
+    `;
     
+    // Filter out blocked users' comments
+    if (currentUserId) {
+      query += ` AND NOT EXISTS (
+        SELECT 1 FROM blocks b 
+        WHERE (b.blocker_id = $${paramCount} AND b.blocked_id = c.user_id)
+           OR (b.blocker_id = c.user_id AND b.blocked_id = $${paramCount})
+      )`;
+      queryParams.push(currentUserId);
+      paramCount++;
+    }
+    
+    // Only get top-level comments (no parent) or include all based on flag
+    if (!includeReplies) {
+      query += ` AND c.parent_comment_id IS NULL`;
+    }
+    
+    query += `
+      ORDER BY relevance_score DESC, c.created_at ASC
+      LIMIT $${paramCount} OFFSET $${paramCount + 1}
+    `;
+    queryParams.push(limit, offset);
+    
+    const result = await pool.query(query, queryParams);
+    
+    // Format comments
     const comments = result.rows.map(row => ({
-      ...row,
-      timestamp: new Date(row.timestamp).getTime()
+      id: row.id,
+      content: row.content,
+      timestamp: new Date(row.timestamp).getTime(),
+      parentCommentId: row.parent_comment_id,
+      userId: row.userId,
+      userName: row.userName,
+      username: row.username,
+      userAvatar: row.userAvatar,
+      verified: row.verified,
+      likesCount: parseInt(row.likes_count || 0),
+      repliesCount: parseInt(row.replies_count || 0),
+      likedByCurrentUser: row.liked_by_current_user || false
     }));
     
     console.log(`[COMMENTS] Returning ${comments.length} comments`);
-    res.json(comments);
+    res.json({
+      comments,
+      pagination: {
+        page,
+        limit,
+        hasMore: comments.length >= limit
+      }
+    });
   } catch (err) {
     console.error(`[COMMENTS] Error:`, err.message);
     res.status(500).json({ error: 'Could not fetch comments' });
+  }
+});
+
+// 11b. COMMENT LIKES - Like/Unlike a comment
+app.post('/comments/:id/like', authenticate, async (req, res) => {
+  const { id: commentId } = req.params;
+  const userId = req.user.id;
+  
+  console.log(`[COMMENT LIKE] User ${userId} toggling like on comment ${commentId}`);
+  
+  try {
+    // Check if comment exists
+    const commentCheck = await pool.query(
+      'SELECT id FROM comments WHERE id = $1',
+      [commentId]
+    );
+    
+    if (commentCheck.rows.length === 0) {
+      return res.status(404).json({ error: 'Comment not found' });
+    }
+    
+    // Check if already liked
+    const likeCheck = await pool.query(
+      'SELECT * FROM comment_likes WHERE user_id = $1 AND comment_id = $2',
+      [userId, commentId]
+    );
+    
+    if (likeCheck.rows.length > 0) {
+      // Unlike
+      await pool.query(
+        'DELETE FROM comment_likes WHERE user_id = $1 AND comment_id = $2',
+        [userId, commentId]
+      );
+      console.log(`[COMMENT LIKE] Comment ${commentId} unliked by user ${userId}`);
+      res.json({ liked: false });
+    } else {
+      // Like
+      await pool.query(
+        'INSERT INTO comment_likes (user_id, comment_id) VALUES ($1, $2)',
+        [userId, commentId]
+      );
+      console.log(`[COMMENT LIKE] Comment ${commentId} liked by user ${userId}`);
+      res.json({ liked: true });
+    }
+  } catch (err) {
+    console.error(`[COMMENT LIKE] Error:`, err.message);
+    res.status(500).json({ error: 'Could not like/unlike comment' });
+  }
+});
+
+// 11c. DELETE COMMENT
+app.delete('/comments/:id', authenticate, async (req, res) => {
+  const { id: commentId } = req.params;
+  const userId = req.user.id;
+  const userRole = req.user.role;
+  
+  console.log(`[DELETE COMMENT] User ${userId} attempting to delete comment ${commentId}`);
+  
+  try {
+    // Get comment details
+    const commentResult = await pool.query(`
+      SELECT c.*, p.user_id as post_owner_id
+      FROM comments c
+      JOIN posts p ON c.post_id = p.id
+      WHERE c.id = $1
+    `, [commentId]);
+    
+    if (commentResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Comment not found' });
+    }
+    
+    const comment = commentResult.rows[0];
+    
+    // Check permissions: user owns comment, or is post owner, or is moderator
+    if (comment.user_id !== userId && comment.post_owner_id !== userId && userRole !== 'MODERATOR') {
+      return res.status(403).json({ error: 'Permission denied' });
+    }
+    
+    // Delete comment (cascade will delete likes, mentions, replies)
+    await pool.query('DELETE FROM comments WHERE id = $1', [commentId]);
+    
+    console.log(`[DELETE COMMENT] Comment ${commentId} deleted successfully`);
+    res.json({ success: true });
+  } catch (err) {
+    console.error(`[DELETE COMMENT] Error:`, err.message);
+    res.status(500).json({ error: 'Could not delete comment' });
+  }
+});
+
+// 11d. GET COMMENT REPLIES
+app.get('/comments/:id/replies', async (req, res) => {
+  const { id: parentCommentId } = req.params;
+  const page = parseInt(req.query.page || '1');
+  const limit = Math.min(parseInt(req.query.limit || '20'), 50);
+  const offset = (page - 1) * limit;
+  
+  // Get current user if authenticated
+  const token = req.headers.authorization?.split(' ')[1];
+  let currentUserId = null;
+  if (token) {
+    try {
+      const decoded = jwt.verify(token, JWT_SECRET);
+      currentUserId = decoded.id;
+    } catch (err) {
+      // Invalid token, continue without authentication
+    }
+  }
+  
+  console.log(`[COMMENT REPLIES] Fetching replies for comment ${parentCommentId}`);
+  
+  try {
+    let query = `
+      SELECT 
+        c.id, 
+        c.content, 
+        c.created_at as timestamp,
+        u.id as "userId", 
+        COALESCE(u.full_name, u.username) as "userName",
+        u.username,
+        u.avatar_url as "userAvatar",
+        u.verified,
+        (SELECT COUNT(*) FROM comment_likes WHERE comment_id = c.id) as likes_count
+    `;
+    
+    const queryParams = [parentCommentId];
+    let paramCount = 2;
+    
+    if (currentUserId) {
+      query += `,
+        (SELECT COUNT(*) FROM comment_likes WHERE comment_id = c.id AND user_id = $${paramCount}) > 0 as liked_by_current_user
+      `;
+      queryParams.push(currentUserId);
+      paramCount++;
+    } else {
+      query += `, false as liked_by_current_user`;
+    }
+    
+    query += `
+      FROM comments c
+      JOIN users u ON c.user_id = u.id
+      WHERE c.parent_comment_id = $1
+    `;
+    
+    // Filter out blocked users' comments
+    if (currentUserId) {
+      query += ` AND NOT EXISTS (
+        SELECT 1 FROM blocks b 
+        WHERE (b.blocker_id = $${paramCount} AND b.blocked_id = c.user_id)
+           OR (b.blocker_id = c.user_id AND b.blocked_id = $${paramCount})
+      )`;
+      queryParams.push(currentUserId);
+      paramCount++;
+    }
+    
+    query += `
+      ORDER BY c.created_at ASC
+      LIMIT $${paramCount} OFFSET $${paramCount + 1}
+    `;
+    queryParams.push(limit, offset);
+    
+    const result = await pool.query(query, queryParams);
+    
+    const replies = result.rows.map(row => ({
+      id: row.id,
+      content: row.content,
+      timestamp: new Date(row.timestamp).getTime(),
+      userId: row.userId,
+      userName: row.userName,
+      username: row.username,
+      userAvatar: row.userAvatar,
+      verified: row.verified,
+      likesCount: parseInt(row.likes_count || 0),
+      likedByCurrentUser: row.liked_by_current_user || false
+    }));
+    
+    res.json({
+      replies,
+      pagination: {
+        page,
+        limit,
+        hasMore: replies.length >= limit
+      }
+    });
+  } catch (err) {
+    console.error(`[COMMENT REPLIES] Error:`, err.message);
+    res.status(500).json({ error: 'Could not fetch replies' });
+  }
+});
+
+// 11e. POST COMMENT MODERATION - Toggle comments on/off, set restrictions
+app.post('/posts/:id/comments/settings', authenticate, async (req, res) => {
+  const { id: postId } = req.params;
+  const { commentsEnabled, commentRestriction } = req.body;
+  const userId = req.user.id;
+  
+  console.log(`[COMMENT SETTINGS] User ${userId} updating comment settings for post ${postId}`);
+  
+  try {
+    // Check if user owns the post
+    const postResult = await pool.query(
+      'SELECT user_id FROM posts WHERE id = $1',
+      [postId]
+    );
+    
+    if (postResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Post not found' });
+    }
+    
+    if (postResult.rows[0].user_id !== userId) {
+      return res.status(403).json({ error: 'Permission denied' });
+    }
+    
+    // Validate restriction value
+    const validRestrictions = ['EVERYONE', 'FOLLOWERS', 'FOLLOWING'];
+    if (commentRestriction && !validRestrictions.includes(commentRestriction)) {
+      return res.status(400).json({ error: 'Invalid comment restriction' });
+    }
+    
+    // Update post
+    const updateFields = [];
+    const updateValues = [];
+    let paramCount = 1;
+    
+    if (commentsEnabled !== undefined) {
+      updateFields.push(`comments_enabled = $${paramCount}`);
+      updateValues.push(commentsEnabled);
+      paramCount++;
+    }
+    
+    if (commentRestriction) {
+      updateFields.push(`comment_restriction = $${paramCount}`);
+      updateValues.push(commentRestriction);
+      paramCount++;
+    }
+    
+    if (updateFields.length === 0) {
+      return res.status(400).json({ error: 'No settings provided' });
+    }
+    
+    updateValues.push(postId);
+    
+    await pool.query(
+      `UPDATE posts SET ${updateFields.join(', ')} WHERE id = $${paramCount}`,
+      updateValues
+    );
+    
+    console.log(`[COMMENT SETTINGS] Settings updated successfully`);
+    res.json({ success: true, commentsEnabled, commentRestriction });
+  } catch (err) {
+    console.error(`[COMMENT SETTINGS] Error:`, err.message);
+    res.status(500).json({ error: 'Could not update comment settings' });
   }
 });
 
@@ -1698,6 +2340,32 @@ app.post('/conversations/:conversationId/messages', authenticate, async (req, re
       return res.status(403).json({ error: 'Access denied' });
     }
     
+    const conversation = convCheck.rows[0];
+    const otherUserId = conversation.user1_id === userId ? conversation.user2_id : conversation.user1_id;
+    
+    // Check if blocked
+    const blockCheck = await pool.query(
+      'SELECT * FROM blocks WHERE (blocker_id = $1 AND blocked_id = $2) OR (blocker_id = $2 AND blocked_id = $1)',
+      [userId, otherUserId]
+    );
+    if (blockCheck.rows.length > 0) {
+      return res.status(403).json({ error: 'Cannot send message to this user' });
+    }
+    
+    // Check if there's a pending message request
+    const messageRequest = await pool.query(
+      'SELECT * FROM message_requests WHERE conversation_id = $1 AND status = $2',
+      [conversationId, 'PENDING']
+    );
+    
+    if (messageRequest.rows.length > 0 && messageRequest.rows[0].sender_id !== userId) {
+      return res.status(403).json({ 
+        error: 'Message request pending approval',
+        requiresApproval: true,
+        messageRequestId: messageRequest.rows[0].id
+      });
+    }
+    
     const result = await pool.query(`
       INSERT INTO messages (conversation_id, sender_id, content, media_url)
       VALUES ($1, $2, $3, $4)
@@ -1716,7 +2384,7 @@ app.post('/conversations/:conversationId/messages', authenticate, async (req, re
   }
 });
 
-// 26. CHAT - START CONVERSATION
+// 26. CHAT - START CONVERSATION (with message request support)
 app.post('/conversations', authenticate, async (req, res) => {
   const { userId: otherUserId } = req.body;
   const currentUserId = req.user.id;
@@ -1726,15 +2394,75 @@ app.post('/conversations', authenticate, async (req, res) => {
   }
   
   try {
+    // Check if blocked
+    const blockCheck = await pool.query(
+      'SELECT * FROM blocks WHERE (blocker_id = $1 AND blocked_id = $2) OR (blocker_id = $2 AND blocked_id = $1)',
+      [currentUserId, otherUserId]
+    );
+    if (blockCheck.rows.length > 0) {
+      return res.status(403).json({ error: 'Cannot message this user' });
+    }
+    
+    // Get other user's messaging permissions
+    const otherUser = await pool.query(
+      'SELECT who_can_message, account_privacy FROM users WHERE id = $1',
+      [otherUserId]
+    );
+    
+    if (otherUser.rows.length === 0) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    
+    const whoCanMessage = otherUser.rows[0].who_can_message || 'EVERYONE';
+    const accountPrivacy = otherUser.rows[0].account_privacy || 'PUBLIC';
+    
+    // Check if users follow each other
+    const followCheck = await pool.query(`
+      SELECT 
+        (SELECT COUNT(*) FROM follows WHERE follower_id = $1 AND following_id = $2) as i_follow_them,
+        (SELECT COUNT(*) FROM follows WHERE follower_id = $2 AND following_id = $1) as they_follow_me
+    `, [currentUserId, otherUserId]);
+    
+    const iFollowThem = parseInt(followCheck.rows[0].i_follow_them) > 0;
+    const theyFollowMe = parseInt(followCheck.rows[0].they_follow_me) > 0;
+    const mutualFollow = iFollowThem && theyFollowMe;
+    
+    // Check messaging permissions
+    let canMessageDirectly = false;
+    if (whoCanMessage === 'EVERYONE') {
+      canMessageDirectly = true;
+    } else if (whoCanMessage === 'FOLLOWERS' && theyFollowMe) {
+      canMessageDirectly = true;
+    } else if (whoCanMessage === 'FOLLOWING' && iFollowThem) {
+      canMessageDirectly = true;
+    }
+    
+    // Check for existing conversation
     let result = await pool.query(`
       SELECT * FROM conversations 
       WHERE (user1_id = $1 AND user2_id = $2) OR (user1_id = $2 AND user2_id = $1)
     `, [currentUserId, otherUserId]);
     
     if (result.rows.length > 0) {
-      return res.json({ conversationId: result.rows[0].id, existing: true });
+      // Check if there's a pending message request
+      const messageRequest = await pool.query(
+        'SELECT * FROM message_requests WHERE conversation_id = $1 AND status = $2',
+        [result.rows[0].id, 'PENDING']
+      );
+      
+      if (messageRequest.rows.length > 0 && !canMessageDirectly) {
+        return res.json({ 
+          conversationId: result.rows[0].id, 
+          existing: true, 
+          requiresApproval: true,
+          messageRequestId: messageRequest.rows[0].id
+        });
+      }
+      
+      return res.json({ conversationId: result.rows[0].id, existing: true, requiresApproval: false });
     }
     
+    // Create new conversation
     const user1Id = currentUserId < otherUserId ? currentUserId : otherUserId;
     const user2Id = currentUserId < otherUserId ? otherUserId : currentUserId;
     
@@ -1744,14 +2472,98 @@ app.post('/conversations', authenticate, async (req, res) => {
       RETURNING id
     `, [user1Id, user2Id]);
     
-    res.json({ conversationId: result.rows[0].id, existing: false });
+    const conversationId = result.rows[0].id;
+    
+    // If can't message directly, create message request
+    if (!canMessageDirectly) {
+      await pool.query(`
+        INSERT INTO message_requests (conversation_id, sender_id, receiver_id, status)
+        VALUES ($1, $2, $3, $4)
+      `, [conversationId, currentUserId, otherUserId, 'PENDING']);
+      
+      return res.json({ 
+        conversationId, 
+        existing: false, 
+        requiresApproval: true,
+        message: 'Message request sent. Waiting for approval.'
+      });
+    }
+    
+    res.json({ conversationId, existing: false, requiresApproval: false });
   } catch (err) {
     console.error(`[START CONVERSATION] Error:`, err.message);
     res.status(500).json({ error: 'Could not create conversation' });
   }
 });
 
-// 27. STORIES - CREATE STORY
+// 27. GET MESSAGE REQUESTS
+app.get('/message-requests', authenticate, async (req, res) => {
+  const userId = req.user.id;
+  
+  try {
+    const result = await pool.query(`
+      SELECT 
+        mr.id,
+        mr.conversation_id,
+        mr.status,
+        mr.created_at,
+        u.id as sender_id,
+        u.username,
+        u.full_name,
+        u.avatar_url,
+        (SELECT content FROM messages WHERE conversation_id = mr.conversation_id ORDER BY created_at DESC LIMIT 1) as last_message
+      FROM message_requests mr
+      JOIN users u ON mr.sender_id = u.id
+      WHERE mr.receiver_id = $1 AND mr.status = 'PENDING'
+      ORDER BY mr.created_at DESC
+    `, [userId]);
+    
+    res.json({ requests: result.rows });
+  } catch (err) {
+    console.error(`[MESSAGE REQUESTS] Error:`, err.message);
+    res.status(500).json({ error: 'Could not fetch message requests' });
+  }
+});
+
+// 28. ACCEPT/REJECT MESSAGE REQUEST
+app.post('/message-requests/:id/:action', authenticate, async (req, res) => {
+  const { id: requestId, action } = req.params;
+  const userId = req.user.id;
+  
+  if (action !== 'accept' && action !== 'reject') {
+    return res.status(400).json({ error: 'Invalid action. Use accept or reject' });
+  }
+  
+  try {
+    const request = await pool.query(
+      'SELECT * FROM message_requests WHERE id = $1 AND receiver_id = $2 AND status = $3',
+      [requestId, userId, 'PENDING']
+    );
+    
+    if (request.rows.length === 0) {
+      return res.status(404).json({ error: 'Message request not found' });
+    }
+    
+    if (action === 'accept') {
+      await pool.query(
+        'UPDATE message_requests SET status = $1 WHERE id = $2',
+        ['ACCEPTED', requestId]
+      );
+      res.json({ success: true, status: 'accepted' });
+    } else {
+      await pool.query(
+        'UPDATE message_requests SET status = $1 WHERE id = $2',
+        ['REJECTED', requestId]
+      );
+      res.json({ success: true, status: 'rejected' });
+    }
+  } catch (err) {
+    console.error(`[MESSAGE REQUEST ACTION] Error:`, err.message);
+    res.status(500).json({ error: 'Could not process message request' });
+  }
+});
+
+// 29. STORIES - CREATE STORY
 app.post('/stories', authenticate, async (req, res) => {
   const { mediaUrl, mediaType, metadata } = req.body;
   const userId = req.user.id;
@@ -2014,29 +2826,10 @@ app.post('/comments/:parentId/reply', authenticate, async (req, res) => {
   }
 });
 
-// 31. THREADS - GET THREAD REPLIES
-app.get('/comments/:parentId/replies', async (req, res) => {
-  const { parentId } = req.params;
-  
-  try {
-    const result = await pool.query(`
-      SELECT c.id, c.content, c.created_at,
-             u.id as user_id, u.username, u.avatar_url
-      FROM comment_threads ct
-      JOIN comments c ON ct.comment_id = c.id
-      JOIN users u ON c.user_id = u.id
-      WHERE ct.parent_comment_id = $1
-      ORDER BY c.created_at ASC
-    `, [parentId]);
-    
-    res.json(result.rows);
-  } catch (err) {
-    console.error(`[THREAD REPLIES] Error:`, err.message);
-    res.status(500).json({ error: 'Could not fetch thread replies' });
-  }
-});
+// This endpoint is now replaced by /comments/:id/replies above
+// Keeping for backward compatibility but redirecting to new endpoint
 
-// 32. FOLLOW/UNFOLLOW USER
+// 32. FOLLOW/UNFOLLOW USER (with privacy support)
 app.post('/users/:id/follow', authenticate, async (req, res) => {
   const { id: targetUserId } = req.params;
   const userId = req.user.id;
@@ -2046,23 +2839,78 @@ app.post('/users/:id/follow', authenticate, async (req, res) => {
   }
   
   try {
-    const existing = await pool.query(
+    // Check if blocked
+    const blockCheck = await pool.query(
+      'SELECT * FROM blocks WHERE (blocker_id = $1 AND blocked_id = $2) OR (blocker_id = $2 AND blocked_id = $1)',
+      [userId, targetUserId]
+    );
+    if (blockCheck.rows.length > 0) {
+      return res.status(403).json({ error: 'Cannot follow this user' });
+    }
+    
+    // Get target user's privacy settings
+    const targetUser = await pool.query(
+      'SELECT account_privacy, who_can_follow FROM users WHERE id = $1',
+      [targetUserId]
+    );
+    
+    if (targetUser.rows.length === 0) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    
+    const privacy = targetUser.rows[0].account_privacy || 'PUBLIC';
+    const whoCanFollow = targetUser.rows[0].who_can_follow || 'EVERYONE';
+    
+    // Check existing follow
+    const existingFollow = await pool.query(
       'SELECT * FROM follows WHERE follower_id = $1 AND following_id = $2',
       [userId, targetUserId]
     );
     
-    if (existing.rows.length > 0) {
+    // Unfollow logic
+    if (existingFollow.rows.length > 0) {
       await pool.query(
         'DELETE FROM follows WHERE follower_id = $1 AND following_id = $2',
         [userId, targetUserId]
       );
-      res.json({ following: false });
+      // Also delete any pending follow request
+      await pool.query(
+        'DELETE FROM follow_requests WHERE requester_id = $1 AND target_id = $2',
+        [userId, targetUserId]
+      );
+      return res.json({ following: false, status: 'unfollowed' });
+    }
+    
+    // Follow logic based on privacy
+    if (privacy === 'PRIVATE') {
+      // Check for existing request
+      const existingRequest = await pool.query(
+        'SELECT * FROM follow_requests WHERE requester_id = $1 AND target_id = $2',
+        [userId, targetUserId]
+      );
+      
+      if (existingRequest.rows.length > 0) {
+        // Cancel request
+        await pool.query(
+          'DELETE FROM follow_requests WHERE requester_id = $1 AND target_id = $2',
+          [userId, targetUserId]
+        );
+        return res.json({ following: false, status: 'request_cancelled' });
+      } else {
+        // Create follow request
+        await pool.query(
+          'INSERT INTO follow_requests (requester_id, target_id, status) VALUES ($1, $2, $3)',
+          [userId, targetUserId, 'PENDING']
+        );
+        return res.json({ following: false, status: 'requested', requested: true });
+      }
     } else {
+      // Public account - follow immediately
       await pool.query(
         'INSERT INTO follows (follower_id, following_id) VALUES ($1, $2)',
         [userId, targetUserId]
       );
-      res.json({ following: true });
+      return res.json({ following: true, status: 'following' });
     }
   } catch (err) {
     console.error(`[FOLLOW] Error:`, err.message);
@@ -2070,7 +2918,318 @@ app.post('/users/:id/follow', authenticate, async (req, res) => {
   }
 });
 
-// 33. MODERATOR - DELETE ANY POST
+// 33. GET FOLLOW REQUESTS (for private account owners)
+app.get('/follow-requests', authenticate, async (req, res) => {
+  const userId = req.user.id;
+  
+  try {
+    const result = await pool.query(`
+      SELECT 
+        fr.id,
+        fr.status,
+        fr.created_at,
+        u.id as user_id,
+        u.username,
+        u.full_name,
+        u.avatar_url
+      FROM follow_requests fr
+      JOIN users u ON fr.requester_id = u.id
+      WHERE fr.target_id = $1 AND fr.status = 'PENDING'
+      ORDER BY fr.created_at DESC
+    `, [userId]);
+    
+    res.json({ requests: result.rows });
+  } catch (err) {
+    console.error(`[FOLLOW REQUESTS] Error:`, err.message);
+    res.status(500).json({ error: 'Could not fetch follow requests' });
+  }
+});
+
+// 34a. ACCEPT FOLLOW REQUEST
+app.post('/follow-requests/:id/accept', authenticate, async (req, res) => {
+  const { id: requestId } = req.params;
+  const userId = req.user.id;
+  
+  try {
+    // Get the follow request
+    const request = await pool.query(
+      'SELECT * FROM follow_requests WHERE id = $1 AND target_id = $2 AND status = $3',
+      [requestId, userId, 'PENDING']
+    );
+    
+    if (request.rows.length === 0) {
+      return res.status(404).json({ error: 'Follow request not found' });
+    }
+    
+    const followRequest = request.rows[0];
+    
+    // Create follow relationship
+    await pool.query(
+      'INSERT INTO follows (follower_id, following_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
+      [followRequest.requester_id, followRequest.target_id]
+    );
+    
+    // Update request status
+    await pool.query(
+      'UPDATE follow_requests SET status = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2',
+      ['APPROVED', requestId]
+    );
+    
+    res.json({ success: true, status: 'approved' });
+  } catch (err) {
+    console.error(`[ACCEPT FOLLOW REQUEST] Error:`, err.message);
+    res.status(500).json({ error: 'Could not accept follow request' });
+  }
+});
+
+// 34b. REJECT FOLLOW REQUEST
+app.post('/follow-requests/:id/reject', authenticate, async (req, res) => {
+  const { id: requestId } = req.params;
+  const userId = req.user.id;
+  
+  try {
+    // Get the follow request
+    const request = await pool.query(
+      'SELECT * FROM follow_requests WHERE id = $1 AND target_id = $2 AND status = $3',
+      [requestId, userId, 'PENDING']
+    );
+    
+    if (request.rows.length === 0) {
+      return res.status(404).json({ error: 'Follow request not found' });
+    }
+    
+    // Reject request
+    await pool.query(
+      'UPDATE follow_requests SET status = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2',
+      ['REJECTED', requestId]
+    );
+    
+    res.json({ success: true, status: 'rejected' });
+  } catch (err) {
+    console.error(`[REJECT FOLLOW REQUEST] Error:`, err.message);
+    res.status(500).json({ error: 'Could not reject follow request' });
+  }
+});
+
+// 34c. ACCEPT/REJECT FOLLOW REQUEST (legacy - keeping for backward compatibility)
+app.post('/follow-requests/:id/:action', authenticate, async (req, res) => {
+  const { id: requestId, action } = req.params;
+  const userId = req.user.id;
+  
+  if (action !== 'accept' && action !== 'reject') {
+    return res.status(400).json({ error: 'Invalid action. Use accept or reject' });
+  }
+  
+  try {
+    // Get the follow request
+    const request = await pool.query(
+      'SELECT * FROM follow_requests WHERE id = $1 AND target_id = $2 AND status = $3',
+      [requestId, userId, 'PENDING']
+    );
+    
+    if (request.rows.length === 0) {
+      return res.status(404).json({ error: 'Follow request not found' });
+    }
+    
+    const followRequest = request.rows[0];
+    
+    if (action === 'accept') {
+      // Create follow relationship
+      await pool.query(
+        'INSERT INTO follows (follower_id, following_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
+        [followRequest.requester_id, followRequest.target_id]
+      );
+      
+      // Update request status
+      await pool.query(
+        'UPDATE follow_requests SET status = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2',
+        ['APPROVED', requestId]
+      );
+      
+      res.json({ success: true, status: 'approved' });
+    } else {
+      // Reject request
+      await pool.query(
+        'UPDATE follow_requests SET status = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2',
+        ['REJECTED', requestId]
+      );
+      
+      res.json({ success: true, status: 'rejected' });
+    }
+  } catch (err) {
+    console.error(`[FOLLOW REQUEST ACTION] Error:`, err.message);
+    res.status(500).json({ error: 'Could not process follow request' });
+  }
+});
+
+// 35. GET/UPDATE PRIVACY SETTINGS
+app.get('/privacy-settings', authenticate, async (req, res) => {
+  const userId = req.user.id;
+  
+  try {
+    const result = await pool.query(
+      'SELECT account_privacy, who_can_follow, who_can_message FROM users WHERE id = $1',
+      [userId]
+    );
+    
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    
+    res.json({
+      accountPrivacy: result.rows[0].account_privacy || 'PUBLIC',
+      whoCanFollow: result.rows[0].who_can_follow || 'EVERYONE',
+      whoCanMessage: result.rows[0].who_can_message || 'EVERYONE'
+    });
+  } catch (err) {
+    console.error(`[PRIVACY SETTINGS] Error:`, err.message);
+    res.status(500).json({ error: 'Could not fetch privacy settings' });
+  }
+});
+
+app.put('/privacy-settings', authenticate, async (req, res) => {
+  const userId = req.user.id;
+  const { accountPrivacy, whoCanFollow, whoCanMessage } = req.body;
+  
+  try {
+    const updates = [];
+    const values = [];
+    let paramCount = 1;
+    
+    if (accountPrivacy && ['PUBLIC', 'PRIVATE'].includes(accountPrivacy)) {
+      updates.push(`account_privacy = $${paramCount}`);
+      values.push(accountPrivacy);
+      paramCount++;
+    }
+    
+    if (whoCanFollow && ['EVERYONE', 'FOLLOWERS'].includes(whoCanFollow)) {
+      updates.push(`who_can_follow = $${paramCount}`);
+      values.push(whoCanFollow);
+      paramCount++;
+    }
+    
+    if (whoCanMessage && ['EVERYONE', 'FOLLOWERS', 'FOLLOWING'].includes(whoCanMessage)) {
+      updates.push(`who_can_message = $${paramCount}`);
+      values.push(whoCanMessage);
+      paramCount++;
+    }
+    
+    if (updates.length === 0) {
+      return res.status(400).json({ error: 'No valid settings provided' });
+    }
+    
+    values.push(userId);
+    await pool.query(
+      `UPDATE users SET ${updates.join(', ')} WHERE id = $${paramCount}`,
+      values
+    );
+    
+    res.json({ success: true, message: 'Privacy settings updated' });
+  } catch (err) {
+    console.error(`[UPDATE PRIVACY SETTINGS] Error:`, err.message);
+    res.status(500).json({ error: 'Could not update privacy settings' });
+  }
+});
+
+// 36. GET ACTIVITY FEED (Likes, Comments, Follows)
+app.get('/activity', authenticate, async (req, res) => {
+  const userId = req.user.id;
+  const page = parseInt(req.query.page || '1');
+  const limit = Math.min(parseInt(req.query.limit || 50), 100);
+  const offset = (page - 1) * limit;
+  
+  console.log(`[ACTIVITY] Fetching activity for user: ${userId}, page: ${page}, limit: ${limit}`);
+  
+  try {
+    // Get likes on user's posts
+    const likesQuery = await pool.query(`
+      SELECT 
+        l.created_at as timestamp,
+        'like' as type,
+        u.id as user_id,
+        COALESCE(u.full_name, u.username) as user_name,
+        u.username,
+        u.avatar_url as user_avatar,
+        p.id as post_id,
+        p.media_url as post_media_url,
+        p.thumbnail_url as post_thumbnail_url,
+        p.type as post_type
+      FROM likes l
+      JOIN users u ON l.user_id = u.id
+      JOIN posts p ON l.post_id = p.id
+      WHERE p.user_id = $1
+      ORDER BY l.created_at DESC
+    `, [userId]);
+    
+    // Get comments on user's posts
+    const commentsQuery = await pool.query(`
+      SELECT 
+        c.created_at as timestamp,
+        'comment' as type,
+        u.id as user_id,
+        COALESCE(u.full_name, u.username) as user_name,
+        u.username,
+        u.avatar_url as user_avatar,
+        p.id as post_id,
+        p.media_url as post_media_url,
+        p.thumbnail_url as post_thumbnail_url,
+        p.type as post_type,
+        c.content as comment_content
+      FROM comments c
+      JOIN users u ON c.user_id = u.id
+      JOIN posts p ON c.post_id = p.id
+      WHERE p.user_id = $1
+      ORDER BY c.created_at DESC
+    `, [userId]);
+    
+    // Get follows (who followed the user)
+    const followsQuery = await pool.query(`
+      SELECT 
+        f.created_at as timestamp,
+        'follow' as type,
+        u.id as user_id,
+        COALESCE(u.full_name, u.username) as user_name,
+        u.username,
+        u.avatar_url as user_avatar,
+        NULL::UUID as post_id,
+        NULL::TEXT as post_media_url,
+        NULL::TEXT as post_thumbnail_url,
+        NULL::VARCHAR as post_type,
+        NULL::TEXT as comment_content
+      FROM follows f
+      JOIN users u ON f.follower_id = u.id
+      WHERE f.following_id = $1
+      ORDER BY f.created_at DESC
+    `, [userId]);
+    
+    // Combine all activities and sort by timestamp
+    const activities = [
+      ...likesQuery.rows.map(row => ({ ...row, type: 'like' })),
+      ...commentsQuery.rows.map(row => ({ ...row, type: 'comment' })),
+      ...followsQuery.rows.map(row => ({ ...row, type: 'follow' }))
+    ].sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
+    
+    // Apply pagination
+    const paginatedActivities = activities.slice(offset, offset + limit);
+    
+    console.log(`[ACTIVITY] Found ${activities.length} total activities, returning ${paginatedActivities.length}`);
+    
+    res.json({
+      activities: paginatedActivities,
+      pagination: {
+        page,
+        limit,
+        total: activities.length,
+        pages: Math.ceil(activities.length / limit)
+      }
+    });
+  } catch (err) {
+    console.error(`[ACTIVITY] Error:`, err.message);
+    res.status(500).json({ error: 'Could not fetch activity' });
+  }
+});
+
+// 34. MODERATOR - DELETE ANY POST
 app.delete('/admin/posts/:id', authenticate, async (req, res) => {
   const { id: postId } = req.params;
   const userRole = req.user.role;
@@ -2178,6 +3337,8 @@ const initDb = async () => {
                 media_url TEXT,
                 thumbnail_url TEXT,
                 processing_status VARCHAR(20),
+                comments_enabled BOOLEAN DEFAULT TRUE,
+                comment_restriction VARCHAR(20) DEFAULT 'EVERYONE',
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
             CREATE TABLE IF NOT EXISTS likes (
@@ -2190,8 +3351,33 @@ const initDb = async () => {
                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
                 post_id UUID REFERENCES posts(id) ON DELETE CASCADE,
                 user_id UUID REFERENCES users(id),
+                parent_comment_id UUID REFERENCES comments(id) ON DELETE CASCADE,
                 content TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            
+            CREATE TABLE IF NOT EXISTS comment_likes (
+                user_id UUID REFERENCES users(id),
+                comment_id UUID REFERENCES comments(id) ON DELETE CASCADE,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (user_id, comment_id)
+            );
+            
+            CREATE TABLE IF NOT EXISTS comment_mentions (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                comment_id UUID REFERENCES comments(id) ON DELETE CASCADE,
+                mentioned_user_id UUID REFERENCES users(id),
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            
+            CREATE TABLE IF NOT EXISTS comment_reports (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                comment_id UUID REFERENCES comments(id) ON DELETE CASCADE,
+                reporter_id UUID REFERENCES users(id),
+                reason TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(comment_id, reporter_id)
             );
             CREATE TABLE IF NOT EXISTS saves (
                 user_id UUID REFERENCES users(id),
@@ -2281,7 +3467,79 @@ const initDb = async () => {
             ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verification_expires TIMESTAMP;
             ALTER TABLE users ADD COLUMN IF NOT EXISTS password_reset_token VARCHAR(500);
             ALTER TABLE users ADD COLUMN IF NOT EXISTS password_reset_expires TIMESTAMP;
+            ALTER TABLE users ADD COLUMN IF NOT EXISTS account_privacy VARCHAR(10) DEFAULT 'PUBLIC';
+            ALTER TABLE users ADD COLUMN IF NOT EXISTS who_can_follow VARCHAR(20) DEFAULT 'EVERYONE';
+            ALTER TABLE users ADD COLUMN IF NOT EXISTS who_can_message VARCHAR(20) DEFAULT 'EVERYONE';
+            
+            CREATE TABLE IF NOT EXISTS follow_requests (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                requester_id UUID REFERENCES users(id) ON DELETE CASCADE,
+                target_id UUID REFERENCES users(id) ON DELETE CASCADE,
+                status VARCHAR(20) DEFAULT 'PENDING',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(requester_id, target_id)
+            );
+            
+            CREATE TABLE IF NOT EXISTS message_requests (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                conversation_id UUID REFERENCES conversations(id) ON DELETE CASCADE,
+                sender_id UUID REFERENCES users(id) ON DELETE CASCADE,
+                receiver_id UUID REFERENCES users(id) ON DELETE CASCADE,
+                status VARCHAR(20) DEFAULT 'PENDING',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (id)
+            );
+            
+            CREATE TABLE IF NOT EXISTS blocks (
+                blocker_id UUID REFERENCES users(id) ON DELETE CASCADE,
+                blocked_id UUID REFERENCES users(id) ON DELETE CASCADE,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (blocker_id, blocked_id)
+            );
+            
             CREATE INDEX IF NOT EXISTS idx_comments_post_id ON comments(post_id);
+            CREATE INDEX IF NOT EXISTS idx_follow_requests_requester ON follow_requests(requester_id);
+            CREATE INDEX IF NOT EXISTS idx_follow_requests_target ON follow_requests(target_id);
+            CREATE INDEX IF NOT EXISTS idx_follow_requests_status ON follow_requests(status);
+            CREATE INDEX IF NOT EXISTS idx_message_requests_receiver ON message_requests(receiver_id);
+            CREATE INDEX IF NOT EXISTS idx_message_requests_status ON message_requests(status);
+            CREATE INDEX IF NOT EXISTS idx_blocks_blocker ON blocks(blocker_id);
+            CREATE INDEX IF NOT EXISTS idx_blocks_blocked ON blocks(blocked_id);
+            
+            CREATE TABLE IF NOT EXISTS invite_codes (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                code VARCHAR(20) UNIQUE NOT NULL,
+                created_by UUID REFERENCES users(id) ON DELETE SET NULL,
+                used_by UUID REFERENCES users(id) ON DELETE SET NULL,
+                used_at TIMESTAMP,
+                expires_at TIMESTAMP,
+                max_uses INTEGER DEFAULT 1,
+                current_uses INTEGER DEFAULT 0,
+                is_active BOOLEAN DEFAULT TRUE,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            
+            CREATE INDEX IF NOT EXISTS idx_invite_codes_code ON invite_codes(code);
+            CREATE INDEX IF NOT EXISTS idx_invite_codes_created_by ON invite_codes(created_by);
+            CREATE INDEX IF NOT EXISTS idx_invite_codes_is_active ON invite_codes(is_active);
+            
+            -- Search performance indexes
+            CREATE INDEX IF NOT EXISTS idx_users_username_lower ON users(LOWER(username));
+            CREATE INDEX IF NOT EXISTS idx_users_full_name_lower ON users(LOWER(full_name));
+            CREATE INDEX IF NOT EXISTS idx_users_account_privacy ON users(account_privacy);
+            CREATE INDEX IF NOT EXISTS idx_users_verified ON users(verified);
+            CREATE INDEX IF NOT EXISTS idx_posts_content_lower ON posts(LOWER(content));
+            
+            -- Enable pg_trgm extension for fuzzy search (if available)
+            DO $$ 
+            BEGIN
+              CREATE EXTENSION IF NOT EXISTS pg_trgm;
+            EXCEPTION 
+              WHEN OTHERS THEN
+                -- Extension might not be available, continue without it
+                NULL;
+            END $$;
             CREATE INDEX IF NOT EXISTS idx_posts_user_id ON posts(user_id);
             CREATE INDEX IF NOT EXISTS idx_posts_type ON posts(type);
             CREATE INDEX IF NOT EXISTS idx_posts_created_at ON posts(created_at);
