@@ -2927,6 +2927,72 @@ app.get('/follow-requests', authenticate, async (req, res) => {
   }
 });
 
+// 33a. ADMIN - CREATE INVITE CODE
+app.post('/admin/invite-codes', authenticate, async (req, res) => {
+  const { role } = req.user;
+  if (!['MODERATOR', 'ADMIN', 'CREATOR'].includes(role)) {
+    return res.status(403).json({ error: 'Permission denied' });
+  }
+
+  const { maxUses = 1, expiresAt = null, code: customCode } = req.body || {};
+  const code = (customCode || Math.random().toString(36).substring(2, 10)).toUpperCase();
+
+  try {
+    const result = await pool.query(
+      `INSERT INTO invite_codes (code, created_by, max_uses, current_uses, is_active, expires_at)
+       VALUES ($1, $2, $3, 0, TRUE, $4)
+       RETURNING id, code, max_uses, current_uses, is_active, expires_at, created_at`,
+      [code, req.user.id, maxUses, expiresAt]
+    );
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error(`[INVITE CODES] Error creating code:`, err.message);
+    res.status(500).json({ error: 'Could not create invite code' });
+  }
+});
+
+// 33b. ADMIN - LIST INVITE CODES
+app.get('/admin/invite-codes', authenticate, async (req, res) => {
+  const { role } = req.user;
+  if (!['MODERATOR', 'ADMIN', 'CREATOR'].includes(role)) {
+    return res.status(403).json({ error: 'Permission denied' });
+  }
+
+  try {
+    const result = await pool.query(`
+      SELECT ic.*, u.username as created_by_username, ub.username as used_by_username
+      FROM invite_codes ic
+      LEFT JOIN users u ON ic.created_by = u.id
+      LEFT JOIN users ub ON ic.used_by = ub.id
+      ORDER BY ic.created_at DESC
+    `);
+    res.json({ inviteCodes: result.rows });
+  } catch (err) {
+    console.error(`[INVITE CODES] Error listing codes:`, err.message);
+    res.status(500).json({ error: 'Could not fetch invite codes' });
+  }
+});
+
+// 33c. ADMIN - DEACTIVATE INVITE CODE
+app.post('/admin/invite-codes/:id/deactivate', authenticate, async (req, res) => {
+  const { role } = req.user;
+  if (!['MODERATOR', 'ADMIN', 'CREATOR'].includes(role)) {
+    return res.status(403).json({ error: 'Permission denied' });
+  }
+
+  const { id } = req.params;
+  try {
+    await pool.query(
+      'UPDATE invite_codes SET is_active = FALSE WHERE id = $1',
+      [id]
+    );
+    res.json({ success: true });
+  } catch (err) {
+    console.error(`[INVITE CODES] Error deactivating code:`, err.message);
+    res.status(500).json({ error: 'Could not deactivate invite code' });
+  }
+});
+
 // 34a. ACCEPT FOLLOW REQUEST
 app.post('/follow-requests/:id/accept', authenticate, async (req, res) => {
   const { id: requestId } = req.params;
@@ -3489,6 +3555,10 @@ const initDb = async () => {
             CREATE INDEX IF NOT EXISTS idx_message_requests_status ON message_requests(status);
             CREATE INDEX IF NOT EXISTS idx_blocks_blocker ON blocks(blocker_id);
             CREATE INDEX IF NOT EXISTS idx_blocks_blocked ON blocks(blocked_id);
+            
+            -- Comments table backfill (if older schema)
+            ALTER TABLE comments ADD COLUMN IF NOT EXISTS parent_comment_id UUID REFERENCES comments(id) ON DELETE CASCADE;
+            ALTER TABLE comments ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
             
             CREATE TABLE IF NOT EXISTS invite_codes (
                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
