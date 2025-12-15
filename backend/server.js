@@ -3468,9 +3468,10 @@ const initDb = async () => {
                 conversation_id UUID REFERENCES conversations(id) ON DELETE CASCADE,
                 sender_id UUID REFERENCES users(id) ON DELETE CASCADE,
                 receiver_id UUID REFERENCES users(id) ON DELETE CASCADE,
+                content TEXT,
+                media_url TEXT,
                 status VARCHAR(20) DEFAULT 'PENDING',
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (id)
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
             
             CREATE TABLE IF NOT EXISTS blocks (
