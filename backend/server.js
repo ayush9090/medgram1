@@ -1,6 +1,7 @@
 const express = require('express');
 const { Pool } = require('pg');
-const Minio = require('minio');
+const { S3Client, PutObjectCommand, GetObjectCommand, CreateMultipartUploadCommand, UploadPartCommand, CompleteMultipartUploadCommand, ListPartsCommand } = require('@aws-sdk/client-s3');
+const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 const cors = require('cors');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
@@ -47,12 +48,20 @@ app.use(cors());
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret';
 const JWT_EXPIRY = process.env.JWT_EXPIRY || '7d';
 
-// MinIO Configuration - All Dynamic
-const MINIO_VIDEOS_BUCKET = process.env.MINIO_VIDEOS_BUCKET || 'videos';
-const MINIO_IMAGES_BUCKET = process.env.MINIO_IMAGES_BUCKET || 'images';
-const MINIO_HLS_BUCKET = process.env.MINIO_HLS_BUCKET || 'hls';
-// MinIO Public URL for generating public URLs (accessible by browser)
-const MINIO_PUBLIC_URL = process.env.MINIO_PUBLIC_URL || 'http://74.208.158.126:9000';
+// Storage Configuration (Supports AWS S3 and DigitalOcean Spaces)
+// If DO_SPACES_ENDPOINT is empty, uses AWS S3 (industry-standard)
+const DO_SPACES_ENDPOINT = process.env.DO_SPACES_ENDPOINT || ''; // Empty for AWS S3, set for DO Spaces
+const DO_SPACES_REGION = process.env.DO_SPACES_REGION || process.env.AWS_REGION || 'us-east-1';
+// Support both DO Spaces keys and AWS credentials
+const DO_SPACES_KEY = process.env.DO_SPACES_KEY || process.env.AWS_ACCESS_KEY_ID || '';
+const DO_SPACES_SECRET = process.env.DO_SPACES_SECRET || process.env.AWS_SECRET_ACCESS_KEY || '';
+const DO_SPACES_VIDEOS_BUCKET = process.env.DO_SPACES_VIDEOS_BUCKET || process.env.AWS_VIDEOS_BUCKET || 'medgram-videos';
+const DO_SPACES_IMAGES_BUCKET = process.env.DO_SPACES_IMAGES_BUCKET || process.env.AWS_IMAGES_BUCKET || 'medgram-images';
+const DO_SPACES_HLS_BUCKET = process.env.DO_SPACES_HLS_BUCKET || process.env.AWS_HLS_BUCKET || 'medgram-hls';
+const DO_SPACES_THUMB_BUCKET = process.env.DO_SPACES_THUMB_BUCKET || process.env.AWS_THUMB_BUCKET || 'medgram-thumb';
+// CDN URL (CloudFront for AWS, Spaces CDN or Cloudflare for DO)
+const DO_SPACES_CDN_URL = process.env.DO_SPACES_CDN_URL || process.env.AWS_CLOUDFRONT_URL || '';
+const IS_AWS_S3 = !DO_SPACES_ENDPOINT; // True if using AWS S3
 
 // Upload Configuration
 const MAX_FILE_SIZE = parseInt(process.env.MAX_FILE_SIZE || '104857600'); // 100MB default
@@ -205,41 +214,67 @@ const pool = new Pool({
   port: 5432,
 });
 
-// --- MINIO CONNECTION ---
-// Connects to the 'medgram_storage' container from your stack (Internal Docker Network)
-// For presigned URLs, we need to use the public URL
-const MINIO_INTERNAL_ENDPOINT = process.env.MINIO_ENDPOINT || 'medgram-storage';
-const MINIO_INTERNAL_PORT = parseInt(process.env.MINIO_PORT || '9000');
-const MINIO_PUBLIC_ENDPOINT = process.env.MINIO_PUBLIC_ENDPOINT || '74.208.158.126'; // Public IP or domain
-const MINIO_PUBLIC_PORT = parseInt(process.env.MINIO_PUBLIC_PORT || '9000');
+// --- STORAGE CONNECTION (AWS S3 or DigitalOcean Spaces) ---
+if (IS_AWS_S3) {
+  console.log(`[AWS S3 INIT] Initializing AWS S3 client (Industry-standard)`);
+  console.log(`[AWS S3 INIT] Region: ${DO_SPACES_REGION}`);
+} else {
+  console.log(`[DO SPACES INIT] Initializing DigitalOcean Spaces client`);
+  console.log(`[DO SPACES INIT] Endpoint: ${DO_SPACES_ENDPOINT}`);
+  console.log(`[DO SPACES INIT] Region: ${DO_SPACES_REGION}`);
+}
+console.log(`[STORAGE INIT] Key: ${DO_SPACES_KEY ? 'Set' : 'Not set'}`);
 
-// Internal client for operations (bucket creation, etc.)
-// This client connects to MinIO via internal Docker network
-console.log(`[MINIO INIT] Creating MinIO client with endpoint: ${MINIO_INTERNAL_ENDPOINT}, port: ${MINIO_INTERNAL_PORT}`);
-console.log(`[MINIO INIT] Environment variables - MINIO_ENDPOINT: ${process.env.MINIO_ENDPOINT}, MINIO_PORT: ${process.env.MINIO_PORT}`);
-console.log(`[MINIO INIT] MINIO_ROOT_USER: ${process.env.MINIO_ROOT_USER || 'minio_admin'}`);
+// Initialize S3 client (works for both AWS S3 and DO Spaces)
+const s3ClientConfig = {
+  region: DO_SPACES_REGION,
+  credentials: {
+    accessKeyId: DO_SPACES_KEY,
+    secretAccessKey: DO_SPACES_SECRET,
+  },
+};
 
-// MinIO client - connects via Docker internal network
-// Changed service name from medgram_storage to medgram-storage (hyphens instead of underscores)
-// because MinIO client rejects hostnames with underscores as "invalid hostname"
-const minioClient = new Minio.Client({
-  endPoint: MINIO_INTERNAL_ENDPOINT,
-  port: MINIO_INTERNAL_PORT,
-  useSSL: false,
-  accessKey: process.env.MINIO_ROOT_USER || 'minio_admin',
-  secretKey: process.env.MINIO_ROOT_PASSWORD || 'secure_minio_password_change_me'
-});
+// Add endpoint only for DO Spaces (AWS S3 uses default endpoints)
+if (!IS_AWS_S3 && DO_SPACES_ENDPOINT) {
+  s3ClientConfig.endpoint = `https://${DO_SPACES_ENDPOINT}`;
+  s3ClientConfig.forcePathStyle = false; // DO Spaces uses virtual-hosted-style
+} else {
+  s3ClientConfig.forcePathStyle = false; // AWS S3 uses virtual-hosted-style by default
+}
 
-console.log(`[MINIO INIT] MinIO client created successfully`);
+const s3Client = new S3Client(s3ClientConfig);
 
-// Public client for presigned URLs (uses public endpoint)
-const minioPublicClient = new Minio.Client({
-  endPoint: MINIO_PUBLIC_ENDPOINT,
-  port: MINIO_PUBLIC_PORT,
-  useSSL: false,
-  accessKey: process.env.MINIO_ROOT_USER || 'minio_admin',
-  secretKey: process.env.MINIO_ROOT_PASSWORD || 'secure_minio_password_change_me',
-});
+// Helper function to get public URL for an object
+const getPublicUrl = (bucketName, objectName) => {
+  // Use CDN URL if configured
+  if (DO_SPACES_CDN_URL) {
+    // Custom CDN (CloudFront for AWS, Cloudflare for DO)
+    return `${DO_SPACES_CDN_URL}/${objectName}`;
+  }
+  
+  // Default public URLs
+  if (IS_AWS_S3) {
+    // AWS S3 public URL format
+    return `https://${bucketName}.s3.${DO_SPACES_REGION}.amazonaws.com/${objectName}`;
+  } else {
+    // DO Spaces public URL format
+    return `https://${bucketName}.${DO_SPACES_ENDPOINT}/${objectName}`;
+  }
+};
+
+// Helper function to ensure bucket exists (buckets must be created via DO console/API)
+const ensureBucket = async (bucketName) => {
+  // Note: Buckets should be created via DigitalOcean console or API
+  // This function just verifies the bucket name is configured
+  console.log(`[DO SPACES] Using bucket: ${bucketName}`);
+  return bucketName;
+};
+
+if (IS_AWS_S3) {
+  console.log(`[AWS S3 INIT] AWS S3 client initialized successfully`);
+} else {
+  console.log(`[DO SPACES INIT] DigitalOcean Spaces client initialized successfully`);
+}
 
 // --- AUTH MIDDLEWARE ---
 const authenticate = (req, res, next) => {
@@ -877,17 +912,17 @@ app.post('/posts', authenticate, async (req, res) => {
   }
 });
 
-// 5. GET PRESIGNED URL (For Video/Image Upload - Dynamic)
+// 5. GET PRESIGNED UPLOAD URL (For Video/Image Upload - Supports multipart/chunked uploads)
 app.post('/upload/presigned', authenticate, async (req, res) => {
-  const { filename, fileType } = req.body; // fileType: 'video', 'image', etc.
-  console.log(`[PRESIGNED URL] User ${req.user.id} requesting upload URL for: ${filename}, type: ${fileType}`);
+  const { filename, fileType, contentType, fileSize } = req.body; // fileType: 'video', 'image', etc.
+  console.log(`[PRESIGNED UPLOAD] User ${req.user.id} requesting upload URL for: ${filename}, type: ${fileType}, size: ${fileSize}`);
   
   // Determine bucket based on file type
-  let bucket = MINIO_VIDEOS_BUCKET;
+  let bucketName = DO_SPACES_VIDEOS_BUCKET;
   if (fileType === 'image' || filename.match(/\.(jpg|jpeg|png|gif|webp)$/i)) {
-    bucket = MINIO_IMAGES_BUCKET;
+    bucketName = DO_SPACES_IMAGES_BUCKET;
   } else if (fileType === 'video' || filename.match(/\.(mp4|mov|avi|mkv|webm)$/i)) {
-    bucket = MINIO_VIDEOS_BUCKET;
+    bucketName = DO_SPACES_VIDEOS_BUCKET;
   }
   
   // Create unique name with timestamp and user ID
@@ -895,42 +930,137 @@ app.post('/upload/presigned', authenticate, async (req, res) => {
   const objectName = `${req.user.id}/${Date.now()}-${Math.random().toString(36).substring(7)}.${fileExtension}`;
   
   try {
-    // Ensure bucket exists using internal client
-    const bucketExists = await minioClient.bucketExists(bucket);
-    if (!bucketExists) {
-      await minioClient.makeBucket(bucket, 'us-east-1');
-      // Set bucket policy to public read
-      try {
-        await minioClient.setBucketPolicy(bucket, JSON.stringify({
-          Version: '2012-10-17',
-          Statement: [{
-            Effect: 'Allow',
-            Principal: { AWS: ['*'] },
-            Action: ['s3:GetObject'],
-            Resource: [`arn:aws:s3:::${bucket}/*`]
-          }]
-        }));
-      } catch (policyErr) {
-        console.log(`[PRESIGNED URL] Note: Could not set bucket policy (may need manual setup)`);
-      }
-      console.log(`[PRESIGNED URL] Created bucket: ${bucket}`);
+    await ensureBucket(bucketName);
+    
+    // For large files (>5MB), use multipart upload (chunked/resumable)
+    const useMultipart = fileSize && fileSize > 5 * 1024 * 1024; // 5MB threshold
+    
+    if (useMultipart) {
+      // Initiate multipart upload for chunked uploads (Instagram-like)
+      const createMultipartCommand = new CreateMultipartUploadCommand({
+        Bucket: bucketName,
+        Key: objectName,
+        ContentType: contentType || (fileType === 'image' ? 'image/jpeg' : 'video/mp4'),
+        CacheControl: 'public, max-age=31536000',
+        ACL: 'public-read', // Make publicly readable
+      });
+      
+      const multipartResponse = await s3Client.send(createMultipartCommand);
+      const uploadId = multipartResponse.UploadId;
+      
+      // Generate presigned URL for first part (client will upload parts sequentially)
+      const getPartUrl = async (partNumber) => {
+        const uploadPartCommand = new UploadPartCommand({
+          Bucket: bucketName,
+          Key: objectName,
+          PartNumber: partNumber,
+          UploadId: uploadId,
+        });
+        return await getSignedUrl(s3Client, uploadPartCommand, { expiresIn: 3600 });
+      };
+      
+      const firstPartUrl = await getPartUrl(1);
+      const publicUrl = getPublicUrl(bucketName, objectName);
+      
+      console.log(`[MULTIPART UPLOAD] Generated multipart upload for object: ${objectName} in bucket: ${bucketName}`);
+      res.json({ 
+        uploadType: 'multipart',
+        uploadId,
+        bucket: bucketName,
+        objectName,
+        firstPartUrl, // URL for uploading first part
+        publicUrl, // Public URL after upload completes
+        expiresIn: 3600,
+        supportsChunked: true,
+        chunkSize: 5 * 1024 * 1024, // 5MB chunks (minimum for S3 multipart)
+        minChunkSize: 5 * 1024 * 1024, // Minimum 5MB per part
+        maxParts: 10000, // S3 supports up to 10,000 parts
+        // Client should call /upload/multipart/part to get URLs for subsequent parts
+      });
+    } else {
+      // For small files, use simple presigned PUT URL
+      const putObjectCommand = new PutObjectCommand({
+        Bucket: bucketName,
+        Key: objectName,
+        ContentType: contentType || (fileType === 'image' ? 'image/jpeg' : 'video/mp4'),
+        CacheControl: 'public, max-age=31536000',
+        ACL: 'public-read',
+      });
+      
+      const uploadUrl = await getSignedUrl(s3Client, putObjectCommand, { expiresIn: PRESIGNED_URL_EXPIRY });
+      const publicUrl = getPublicUrl(bucketName, objectName);
+      
+      console.log(`[PRESIGNED UPLOAD] Generated presigned URL for object: ${objectName} in bucket: ${bucketName}`);
+      res.json({ 
+        uploadType: 'simple',
+        uploadUrl,
+        publicUrl,
+        bucket: bucketName,
+        objectName,
+        expiresIn: PRESIGNED_URL_EXPIRY,
+        supportsChunked: false,
+      });
     }
+  } catch (err) {
+    console.error(`[PRESIGNED UPLOAD] Error:`, err.message);
+    res.status(500).json({ error: 'Could not generate upload URL', details: err.message });
+  }
+});
+
+// 5a. GET PRESIGNED URL FOR MULTIPART PART (for chunked uploads)
+app.post('/upload/multipart/part', authenticate, async (req, res) => {
+  const { bucket, objectName, uploadId, partNumber } = req.body;
+  console.log(`[MULTIPART PART] User ${req.user.id} requesting part ${partNumber} URL for: ${objectName}`);
+  
+  try {
+    const uploadPartCommand = new UploadPartCommand({
+      Bucket: bucket,
+      Key: objectName,
+      PartNumber: partNumber,
+      UploadId: uploadId,
+    });
     
-    // Generate presigned URL using public client (so browser can access it)
-    const url = await minioPublicClient.presignedPutObject(bucket, objectName, PRESIGNED_URL_EXPIRY);
-    const publicUrl = `${MINIO_PUBLIC_URL}/${bucket}/${objectName}`;
+    const partUrl = await getSignedUrl(s3Client, uploadPartCommand, { expiresIn: 3600 });
     
-    console.log(`[PRESIGNED URL] Generated URL for object: ${objectName} in bucket: ${bucket}`);
-    res.json({ 
-      uploadUrl: url, 
-      publicUrl,
-      bucket,
-      objectName,
-      expiresIn: PRESIGNED_URL_EXPIRY
+    res.json({
+      partUrl,
+      partNumber,
+      expiresIn: 3600,
     });
   } catch (err) {
-    console.error(`[PRESIGNED URL] Error:`, err.message);
-    res.status(500).json({ error: 'Could not generate upload URL' });
+    console.error(`[MULTIPART PART] Error:`, err.message);
+    res.status(500).json({ error: 'Could not generate part URL', details: err.message });
+  }
+});
+
+// 5b. COMPLETE MULTIPART UPLOAD
+app.post('/upload/multipart/complete', authenticate, async (req, res) => {
+  const { bucket, objectName, uploadId, parts } = req.body; // parts: [{ PartNumber, ETag }]
+  console.log(`[MULTIPART COMPLETE] User ${req.user.id} completing multipart upload: ${objectName}`);
+  
+  try {
+    const completeCommand = new CompleteMultipartUploadCommand({
+      Bucket: bucket,
+      Key: objectName,
+      UploadId: uploadId,
+      MultipartUpload: {
+        Parts: parts, // Array of { PartNumber, ETag }
+      },
+    });
+    
+    const result = await s3Client.send(completeCommand);
+    const publicUrl = getPublicUrl(bucket, objectName);
+    
+    console.log(`[MULTIPART COMPLETE] Upload completed: ${objectName}`);
+    res.json({
+      success: true,
+      publicUrl,
+      etag: result.ETag,
+      location: result.Location,
+    });
+  } catch (err) {
+    console.error(`[MULTIPART COMPLETE] Error:`, err.message);
+    res.status(500).json({ error: 'Could not complete upload', details: err.message });
   }
 });
 
@@ -958,82 +1088,37 @@ app.post('/upload/direct', authenticate, upload.single('file'), async (req, res)
   const file = req.file;
   const isImage = file.mimetype.startsWith('image/');
   const isVideo = file.mimetype.startsWith('video/');
-  const bucket = isImage ? MINIO_IMAGES_BUCKET : MINIO_VIDEOS_BUCKET;
+  const bucketName = isImage ? DO_SPACES_IMAGES_BUCKET : DO_SPACES_VIDEOS_BUCKET;
   
-  console.log(`[DIRECT UPLOAD] User ${req.user.id} uploading ${file.mimetype} (${file.size} bytes) to ${bucket}`);
+  console.log(`[DIRECT UPLOAD] User ${req.user.id} uploading ${file.mimetype} (${file.size} bytes) to ${bucketName}`);
   
   try {
-    // Ensure bucket exists - use internal client
-    let bucketExists = false;
-    try {
-      bucketExists = await minioClient.bucketExists(bucket);
-    } catch (checkErr) {
-      console.log(`[DIRECT UPLOAD] Error checking bucket existence: ${checkErr.message}`);
-      // Continue and try to create bucket
-    }
-    
-    if (!bucketExists) {
-      try {
-        await minioClient.makeBucket(bucket, 'us-east-1');
-        console.log(`[DIRECT UPLOAD] Created bucket: ${bucket}`);
-        
-        // Set bucket policy to public read
-        try {
-          await minioClient.setBucketPolicy(bucket, JSON.stringify({
-            Version: '2012-10-17',
-            Statement: [{
-              Effect: 'Allow',
-              Principal: { AWS: ['*'] },
-              Action: ['s3:GetObject'],
-              Resource: [`arn:aws:s3:::${bucket}/*`]
-            }]
-          }));
-          console.log(`[DIRECT UPLOAD] Set public policy for bucket: ${bucket}`);
-        } catch (policyErr) {
-          console.log(`[DIRECT UPLOAD] Note: Could not set bucket policy (non-critical): ${policyErr.message}`);
-        }
-      } catch (createErr) {
-        console.error(`[DIRECT UPLOAD] Error creating bucket: ${createErr.message}`);
-        // Try to continue - bucket might already exist
-      }
-    }
+    await ensureBucket(bucketName);
     
     const objectName = `${req.user.id}/${Date.now()}-${Math.random().toString(36).substring(7)}-${file.originalname.replace(/[^a-zA-Z0-9.-]/g, '_')}`;
     
-    console.log(`[DIRECT UPLOAD] Attempting to upload to MinIO: ${MINIO_INTERNAL_ENDPOINT}:${MINIO_INTERNAL_PORT}, bucket: ${bucket}`);
-    console.log(`[DIRECT UPLOAD] MinIO Client config - endpoint: ${MINIO_INTERNAL_ENDPOINT}, port: ${MINIO_INTERNAL_PORT}, bucket: ${bucket}`);
-    
-    // Test MinIO connection first
-    try {
-      const testBucketExists = await minioClient.bucketExists(bucket);
-      console.log(`[DIRECT UPLOAD] Bucket ${bucket} exists: ${testBucketExists}`);
-    } catch (testErr) {
-      console.error(`[DIRECT UPLOAD] Error testing MinIO connection: ${testErr.message}`);
-      console.error(`[DIRECT UPLOAD] Error stack:`, testErr.stack);
-      throw new Error(`MinIO connection failed: ${testErr.message}`);
-    }
-    
-    // MinIO putObject signature: putObject(bucketName, objectName, stream, size, metaData)
-    // Convert buffer to stream
-    const { Readable } = require('stream');
-    const bufferStream = new Readable();
-    bufferStream.push(file.buffer);
-    bufferStream.push(null); // End the stream
-    
     console.log(`[DIRECT UPLOAD] Uploading file: ${objectName}, size: ${file.size} bytes, type: ${file.mimetype}`);
     
-    await minioClient.putObject(bucket, objectName, bufferStream, file.size, {
-      'Content-Type': file.mimetype
+    // Upload to DO Spaces (S3-compatible)
+    const putCommand = new PutObjectCommand({
+      Bucket: bucketName,
+      Key: objectName,
+      Body: file.buffer,
+      ContentType: file.mimetype,
+      CacheControl: 'public, max-age=31536000',
+      ACL: 'public-read', // Make publicly readable
     });
     
-    // Construct public URL - use the public endpoint configured
-    const publicUrl = `http://${MINIO_PUBLIC_ENDPOINT}:${MINIO_PUBLIC_PORT}/${bucket}/${objectName}`;
+    await s3Client.send(putCommand);
+    
+    // Get public URL
+    const publicUrl = getPublicUrl(bucketName, objectName);
     
     console.log(`[DIRECT UPLOAD] File uploaded successfully: ${objectName}, URL: ${publicUrl}`);
     res.json({
       success: true,
       url: publicUrl,
-      bucket,
+      bucket: bucketName,
       objectName,
       type: isImage ? 'image' : 'video',
       size: file.size
@@ -3614,14 +3699,22 @@ const initDb = async () => {
 const PORT = process.env.PORT || 4000;
 console.log(`[SERVER] Starting server on port: ${PORT} (from env: ${process.env.PORT || 'default 4000'})`);
 console.log(`[SERVER] Environment: POSTGRES_HOST=${process.env.POSTGRES_HOST || 'medgram_db'}`);
-console.log(`[SERVER] Environment: MINIO_ENDPOINT=${process.env.MINIO_ENDPOINT || 'medgram_storage'}`);
+if (IS_AWS_S3) {
+  console.log(`[SERVER] Environment: AWS_REGION=${DO_SPACES_REGION}`);
+} else {
+  console.log(`[SERVER] Environment: DO_SPACES_ENDPOINT=${DO_SPACES_ENDPOINT}`);
+}
 
 app.listen(PORT, '0.0.0.0', async () => {
     console.log(`[SERVER] ✅ Backend running on port ${PORT}`);
     console.log(`[SERVER] Configuration:`);
-    console.log(`  Videos Bucket: ${MINIO_VIDEOS_BUCKET}`);
-    console.log(`  Images Bucket: ${MINIO_IMAGES_BUCKET}`);
-    console.log(`  HLS Bucket: ${MINIO_HLS_BUCKET}`);
+    console.log(`  Storage: ${IS_AWS_S3 ? 'AWS S3 (Industry-standard)' : 'DigitalOcean Spaces (S3-compatible)'}`);
+    console.log(`  Region: ${DO_SPACES_REGION}`);
+    console.log(`  Videos Bucket: ${DO_SPACES_VIDEOS_BUCKET}`);
+    console.log(`  Images Bucket: ${DO_SPACES_IMAGES_BUCKET}`);
+    console.log(`  HLS Bucket: ${DO_SPACES_HLS_BUCKET}`);
+    console.log(`  Thumbnails Bucket: ${DO_SPACES_THUMB_BUCKET}`);
+    console.log(`  CDN URL: ${DO_SPACES_CDN_URL || 'Not configured'}`);
     console.log(`  Max File Size: ${MAX_FILE_SIZE / 1024 / 1024}MB`);
     console.log(`[SERVER] Available endpoints:`);
     console.log(`  POST   /auth/register (email/phone, NPI/License verification, email verification)`);
@@ -3650,3 +3743,4 @@ app.listen(PORT, '0.0.0.0', async () => {
     // Wait a bit for DB to be ready in Docker
     setTimeout(initDb, 5000);
 });
+
