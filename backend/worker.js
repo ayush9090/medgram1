@@ -1,5 +1,6 @@
 const { Pool } = require('pg');
-const Minio = require('minio');
+const { S3Client, GetObjectCommand, PutObjectCommand } = require('@aws-sdk/client-s3');
+const { Readable } = require('stream');
 const ffmpeg = require('fluent-ffmpeg');
 const fs = require('fs');
 const path = require('path');
@@ -8,10 +9,15 @@ const os = require('os');
 console.log("Worker Service Starting...");
 
 // --- CONFIGURATION ---
-const RAW_BUCKET = 'videos';
-const HLS_BUCKET = 'hls';
-// Use environment variable for public URL (accessible by browser)
-const MINIO_PUBLIC_URL = process.env.MINIO_PUBLIC_URL || 'http://localhost:9000';
+// Supports both AWS S3 and DigitalOcean Spaces
+const DO_SPACES_ENDPOINT = process.env.DO_SPACES_ENDPOINT || '';
+const DO_SPACES_REGION = process.env.DO_SPACES_REGION || process.env.AWS_REGION || 'us-east-1';
+const DO_SPACES_KEY = process.env.DO_SPACES_KEY || process.env.AWS_ACCESS_KEY_ID || '';
+const DO_SPACES_SECRET = process.env.DO_SPACES_SECRET || process.env.AWS_SECRET_ACCESS_KEY || '';
+const RAW_BUCKET = process.env.DO_SPACES_VIDEOS_BUCKET || process.env.AWS_VIDEOS_BUCKET || 'medgram-videos';
+const HLS_BUCKET = process.env.DO_SPACES_HLS_BUCKET || process.env.AWS_HLS_BUCKET || 'medgram-hls';
+const DO_SPACES_CDN_URL = process.env.DO_SPACES_CDN_URL || process.env.AWS_CLOUDFRONT_URL || '';
+const IS_AWS_S3 = !DO_SPACES_ENDPOINT;
 
 // --- DB CONNECTION ---
 const pool = new Pool({
@@ -22,40 +28,39 @@ const pool = new Pool({
   port: 5432,
 });
 
-// --- MINIO CONNECTION ---
-// Connects to internal docker network alias
-const minioClient = new Minio.Client({
-  endPoint: process.env.MINIO_ENDPOINT || 'medgram-storage',
-  port: parseInt(process.env.MINIO_PORT || '9000'),
-  useSSL: false,
-  accessKey: process.env.MINIO_ROOT_USER || 'minio_admin',
-  secretKey: process.env.MINIO_ROOT_PASSWORD || 'secure_minio_password_change_me',
-});
+// --- STORAGE CONNECTION (AWS S3 or DigitalOcean Spaces) ---
+const s3ClientConfig = {
+  region: DO_SPACES_REGION,
+  credentials: {
+    accessKeyId: DO_SPACES_KEY,
+    secretAccessKey: DO_SPACES_SECRET,
+  },
+};
 
-// Ensure HLS bucket exists
-const ensureBucket = async () => {
-  try {
-    const exists = await minioClient.bucketExists(HLS_BUCKET);
-    if (!exists) {
-      await minioClient.makeBucket(HLS_BUCKET, 'us-east-1');
-      // Set policy to public read for HLS bucket
-      const policy = {
-        Version: "2012-10-17",
-        Statement: [
-          {
-            Effect: "Allow",
-            Principal: { AWS: ["*"] },
-            Action: ["s3:GetObject"],
-            Resource: [`arn:aws:s3:::${HLS_BUCKET}/*`]
-          }
-        ]
-      };
-      await minioClient.setBucketPolicy(HLS_BUCKET, JSON.stringify(policy));
-      console.log(`Bucket ${HLS_BUCKET} created and public policy set.`);
-    }
-  } catch (err) {
-    console.error('Error checking/creating HLS bucket:', err);
+if (!IS_AWS_S3 && DO_SPACES_ENDPOINT) {
+  s3ClientConfig.endpoint = `https://${DO_SPACES_ENDPOINT}`;
+  s3ClientConfig.forcePathStyle = false;
+} else {
+  s3ClientConfig.forcePathStyle = false;
+}
+
+const s3Client = new S3Client(s3ClientConfig);
+
+// Helper function to get public URL
+const getPublicUrl = (bucketName, objectName) => {
+  if (DO_SPACES_CDN_URL) {
+    return `${DO_SPACES_CDN_URL}/${objectName}`;
   }
+  if (IS_AWS_S3) {
+    return `https://${bucketName}.s3.${DO_SPACES_REGION}.amazonaws.com/${objectName}`;
+  }
+  return `https://${bucketName}.${DO_SPACES_ENDPOINT}/${objectName}`;
+};
+
+// Ensure HLS bucket exists (buckets must be created via DO console/API)
+const ensureBucket = async () => {
+  console.log(`Using HLS bucket: ${HLS_BUCKET}`);
+  // Note: Buckets should be created via DigitalOcean console
 };
 
 // Process a single video
@@ -69,21 +74,47 @@ const processVideo = async (post) => {
   try {
     // 1. Download raw file
     // The media_url in DB is the full public URL. We need to parse the object name.
-    // Format: http://74.208.158.126:9000/videos/userId/timestamp-random-filename.mp4
+    // AWS S3 URL: https://bucket-name.s3.region.amazonaws.com/userId/timestamp-filename.mp4
+    // DO Spaces URL: https://bucket-name.region.digitaloceanspaces.com/userId/timestamp-filename.mp4
+    // CDN URL: https://cdn.example.com/userId/timestamp-filename.mp4
     // We need to extract: userId/timestamp-random-filename.mp4
     let objectName;
     if (post.media_url.includes(`/${RAW_BUCKET}/`)) {
-      // Extract path after /videos/
       const urlParts = post.media_url.split(`/${RAW_BUCKET}/`);
-      objectName = urlParts[1]; // This includes userId/timestamp-filename.mp4
+      objectName = urlParts[1];
+    } else if (IS_AWS_S3 && post.media_url.includes(`${RAW_BUCKET}.s3.${DO_SPACES_REGION}.amazonaws.com/`)) {
+      const urlParts = post.media_url.split(`${RAW_BUCKET}.s3.${DO_SPACES_REGION}.amazonaws.com/`);
+      objectName = urlParts[1];
+    } else if (!IS_AWS_S3 && post.media_url.includes(`${RAW_BUCKET}.${DO_SPACES_ENDPOINT}/`)) {
+      const urlParts = post.media_url.split(`${RAW_BUCKET}.${DO_SPACES_ENDPOINT}/`);
+      objectName = urlParts[1];
     } else {
-      // Fallback: try to extract from URL
+      // Try to extract from CDN URL or any other format
       const urlParts = post.media_url.split('/');
-      objectName = urlParts.slice(urlParts.indexOf(RAW_BUCKET) + 1).join('/');
+      const domainIndex = urlParts.findIndex(part => part.includes('.') && !part.includes('://'));
+      if (domainIndex !== -1 && domainIndex < urlParts.length - 1) {
+        objectName = urlParts.slice(domainIndex + 1).join('/');
+      } else {
+        throw new Error(`Could not parse object name from URL: ${post.media_url}`);
+      }
     }
 
     console.log(`Downloading ${objectName} from ${RAW_BUCKET}...`);
-    await minioClient.fGetObject(RAW_BUCKET, objectName, inputPath);
+    const getCommand = new GetObjectCommand({
+      Bucket: RAW_BUCKET,
+      Key: objectName,
+    });
+    
+    const response = await s3Client.send(getCommand);
+    const stream = response.Body;
+    
+    // Write stream to file
+    const writeStream = fs.createWriteStream(inputPath);
+    await new Promise((resolve, reject) => {
+      stream.pipe(writeStream);
+      stream.on('error', reject);
+      writeStream.on('finish', resolve);
+    });
 
     // 2. Transcode to HLS with adaptive bitrates (like Instagram)
     console.log('Transcoding to HLS with adaptive streaming...');
@@ -121,17 +152,28 @@ const processVideo = async (post) => {
       const filePath = path.join(hlsOutputDir, file);
       const stat = fs.statSync(filePath);
       if (stat.isFile()) {
-        const metaData = { 
-          'Content-Type': file.endsWith('.m3u8') ? 'application/x-mpegURL' : 'video/MP2T' 
-        };
-        await minioClient.fPutObject(HLS_BUCKET, `${hlsFolder}/${file}`, filePath, metaData);
-        console.log(`Uploaded HLS file: ${hlsFolder}/${file}`);
+        const objectKey = `${hlsFolder}/${file}`;
+        const fileContent = fs.readFileSync(filePath);
+        const contentType = file.endsWith('.m3u8') ? 'application/x-mpegURL' : 'video/MP2T';
+        
+        const putCommand = new PutObjectCommand({
+          Bucket: HLS_BUCKET,
+          Key: objectKey,
+          Body: fileContent,
+          ContentType: contentType,
+          CacheControl: 'public, max-age=31536000',
+          ACL: 'public-read',
+        });
+        
+        await s3Client.send(putCommand);
+        console.log(`Uploaded HLS file: ${objectKey}`);
       }
     }
 
     // 4. Update Database
     // Use the configured public URL for the HLS manifest
-    const newMediaUrl = `${MINIO_PUBLIC_URL}/${HLS_BUCKET}/${hlsFolder}/${outputFileName}`;
+    const manifestKey = `${hlsFolder}/${outputFileName}`;
+    const newMediaUrl = getPublicUrl(HLS_BUCKET, manifestKey);
     
     await pool.query(
       `UPDATE posts SET media_url = $1, processing_status = 'COMPLETED' WHERE id = $2`,
