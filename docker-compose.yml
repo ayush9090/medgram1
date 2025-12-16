@@ -35,64 +35,66 @@ services:
       timeout: 5s
       retries: 5
 
-  # 2. MinIO Object Storage
-  medgram-storage:
-    image: minio/minio
-    container_name: medgram-storage
-    command: server /data --console-address ":9001"
-    environment:
-      MINIO_ROOT_USER: minio_admin
-      MINIO_ROOT_PASSWORD: secure_minio_password_change_me
-    ports:
-      - "9000:9000"
-      - "9001:9001"
-    volumes:
-      - minio_data:/data
-    networks:
-      - medgram_network
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
-      interval: 30s
-      timeout: 20s
-      retries: 3
+  # 2. MinIO Object Storage (OPTIONAL - Commented out if using Google Cloud Storage)
+  # Uncomment below if you want to use MinIO instead of GCS
+  # medgram-storage:
+  #   image: minio/minio
+  #   container_name: medgram-storage
+  #   command: server /data --console-address ":9001"
+  #   environment:
+  #     MINIO_ROOT_USER: minio_admin
+  #     MINIO_ROOT_PASSWORD: secure_minio_password_change_me
+  #   ports:
+  #     - "9000:9000"
+  #     - "9001:9001"
+  #   volumes:
+  #     - minio_data:/data
+  #   networks:
+  #     - medgram_network
+  #   healthcheck:
+  #     test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+  #     interval: 30s
+  #     timeout: 20s
+  #     retries: 3
 
-  # 3. Setup MinIO Buckets
-  create-buckets:
-    image: minio/mc
-    depends_on:
-      medgram-storage:
-        condition: service_healthy
-    entrypoint: >
-      /bin/sh -c "
-      echo 'Waiting for MinIO to be fully ready...';
-      sleep 3;
-      echo 'Setting up MinIO alias...';
-      MAX_RETRIES=10;
-      RETRY=0;
-      while [ $RETRY -lt $MAX_RETRIES ]; do
-        if /usr/bin/mc alias set myminio http://medgram_storage:9000 minio_admin secure_minio_password_change_me 2>&1; then
-          echo 'Alias set successfully!';
-          break;
-        else
-          RETRY=$((RETRY+1));
-          echo \"Retry $RETRY/$MAX_RETRIES: Waiting for MinIO...\";
-          sleep 2;
-        fi;
-      done;
-      if [ $RETRY -eq $MAX_RETRIES ]; then
-        echo 'WARNING: Failed to set alias after retries, but continuing...';
-      fi;
-      echo 'Creating buckets...';
-      /usr/bin/mc mb myminio/videos 2>/dev/null || echo 'Bucket videos already exists';
-      /usr/bin/mc mb myminio/images 2>/dev/null || echo 'Bucket images already exists';
-      /usr/bin/mc mb myminio/hls 2>/dev/null || echo 'Bucket hls already exists';
-      echo 'Setting bucket permissions...';
-      /usr/bin/mc anonymous set public myminio/videos 2>/dev/null || echo 'Note: videos permission may already be set';
-      /usr/bin/mc anonymous set public myminio/images 2>/dev/null || echo 'Note: images permission may already be set';
-      /usr/bin/mc anonymous set public myminio/hls 2>/dev/null || echo 'Note: hls permission may already be set';
-      echo 'Bucket setup completed!';
-      exit 0;
-      "
+  # 3. Setup MinIO Buckets (OPTIONAL - Only needed if using MinIO)
+  # Uncomment below if you want to use MinIO instead of AWS S3
+  # create-buckets:
+  #   image: minio/mc
+  #   depends_on:
+  #     medgram-storage:
+  #       condition: service_healthy
+  #   entrypoint: >
+  #     /bin/sh -c "
+  #     echo 'Waiting for MinIO to be fully ready...';
+  #     sleep 3;
+  #     echo 'Setting up MinIO alias...';
+  #     MAX_RETRIES=10;
+  #     RETRY=0;
+  #     while [ $RETRY -lt $MAX_RETRIES ]; do
+  #       if /usr/bin/mc alias set myminio http://medgram_storage:9000 minio_admin secure_minio_password_change_me 2>&1; then
+  #         echo 'Alias set successfully!';
+  #         break;
+  #       else
+  #         RETRY=$((RETRY+1));
+  #         echo \"Retry $RETRY/$MAX_RETRIES: Waiting for MinIO...\";
+  #         sleep 2;
+  #       fi;
+  #     done;
+  #     if [ $RETRY -eq $MAX_RETRIES ]; then
+  #       echo 'WARNING: Failed to set alias after retries, but continuing...';
+  #     fi;
+  #     echo 'Creating buckets...';
+  #     /usr/bin/mc mb myminio/videos 2>/dev/null || echo 'Bucket videos already exists';
+  #     /usr/bin/mc mb myminio/images 2>/dev/null || echo 'Bucket images already exists';
+  #     /usr/bin/mc mb myminio/hls 2>/dev/null || echo 'Bucket hls already exists';
+  #     echo 'Setting bucket permissions...';
+  #     /usr/bin/mc anonymous set public myminio/videos 2>/dev/null || echo 'Note: videos permission may already be set';
+  #     /usr/bin/mc anonymous set public myminio/images 2>/dev/null || echo 'Note: images permission may already be set';
+  #     /usr/bin/mc anonymous set public myminio/hls 2>/dev/null || echo 'Note: hls permission may already be set';
+  #     echo 'Bucket setup completed!';
+  #     exit 0;
+  #     "
 
   # 4. API Backend
   medgram_backend:
@@ -103,13 +105,20 @@ services:
     restart: always
     environment:
       POSTGRES_HOST: medgram_db
-      MINIO_ENDPOINT: medgram-storage
       PORT: 4000
-      # Points to your server IP so devices can access media
-      MINIO_PUBLIC_URL: http://74.208.158.126:9000
-      # MinIO public endpoint for presigned URLs (must be accessible from browser)
-      MINIO_PUBLIC_ENDPOINT: 74.208.158.126
-      MINIO_PUBLIC_PORT: 9000
+      # AWS S3 Configuration (Industry-standard storage)
+      # Empty DO_SPACES_ENDPOINT = AWS S3, Set endpoint = DigitalOcean Spaces
+      # See AWS_S3_SETUP.md and AWS_SERVER_SETUP.md for detailed setup instructions
+      DO_SPACES_ENDPOINT: ${DO_SPACES_ENDPOINT:-}  # Empty = AWS S3
+      DO_SPACES_REGION: ${DO_SPACES_REGION:-us-east-1}  # AWS region
+      DO_SPACES_KEY: ${DO_SPACES_KEY:-AKIAYKFQRGK6LTJRM4HC}  # AWS Access Key ID
+      DO_SPACES_SECRET: ${DO_SPACES_SECRET:-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}  # AWS Secret Access Key
+      DO_SPACES_VIDEOS_BUCKET: ${DO_SPACES_VIDEOS_BUCKET:-medgram-videos}
+      DO_SPACES_IMAGES_BUCKET: ${DO_SPACES_IMAGES_BUCKET:-medgram-images}
+      DO_SPACES_HLS_BUCKET: ${DO_SPACES_HLS_BUCKET:-medgram-hls}
+      DO_SPACES_THUMB_BUCKET: ${DO_SPACES_THUMB_BUCKET:-medgram-thumb}
+      # CloudFront CDN URL (for fast global delivery)
+      DO_SPACES_CDN_URL: ${DO_SPACES_CDN_URL:-https://d2sfmoef7qs2f4.cloudfront.net}
       # Email Configuration (configure these for email authentication)
       # For Gmail: Use App Password (NOT regular password)
       # Get App Password: https://myaccount.google.com/apppasswords
@@ -126,8 +135,7 @@ services:
     depends_on:
       medgram_db:
         condition: service_healthy
-      medgram-storage:
-        condition: service_healthy
+      # Removed medgram-storage dependency (using AWS S3 instead)
 
   # 5. Video Processing Worker
   medgram_worker:
@@ -139,15 +147,20 @@ services:
     command: ["npm", "run", "worker"]
     environment:
       POSTGRES_HOST: medgram_db
-      MINIO_ENDPOINT: medgram-storage
-      MINIO_PUBLIC_URL: http://74.208.158.126:9000
+      # AWS S3 Configuration (same as backend)
+      DO_SPACES_ENDPOINT: ${DO_SPACES_ENDPOINT:-}  # Empty = AWS S3
+      DO_SPACES_REGION: ${DO_SPACES_REGION:-us-east-1}  # AWS region
+      DO_SPACES_KEY: ${DO_SPACES_KEY:-AKIAYKFQRGK6LTJRM4HC}  # AWS Access Key ID
+      DO_SPACES_SECRET: ${DO_SPACES_SECRET:-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}  # AWS Secret Access Key
+      DO_SPACES_VIDEOS_BUCKET: ${DO_SPACES_VIDEOS_BUCKET:-medgram-videos}
+      DO_SPACES_HLS_BUCKET: ${DO_SPACES_HLS_BUCKET:-medgram-hls}
+      DO_SPACES_CDN_URL: ${DO_SPACES_CDN_URL:-https://d2sfmoef7qs2f4.cloudfront.net}
     networks:
       - medgram_network
     depends_on:
       medgram_db:
         condition: service_healthy
-      medgram-storage:
-        condition: service_healthy
+      # Removed medgram-storage dependency (using AWS S3 instead)
       medgram_backend:
         condition: service_started
 
