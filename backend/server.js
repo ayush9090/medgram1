@@ -246,19 +246,27 @@ const s3Client = new S3Client(s3ClientConfig);
 
 // Helper function to get public URL for an object
 const getPublicUrl = (bucketName, objectName) => {
-  // Use CDN URL if configured
+  let url;
+  
+  // Use CDN URL if configured (CloudFront for AWS S3)
   if (DO_SPACES_CDN_URL) {
     // Custom CDN (CloudFront for AWS, Cloudflare for DO)
-    return `${DO_SPACES_CDN_URL}/${objectName}`;
+    url = `${DO_SPACES_CDN_URL}/${objectName}`;
+    console.log(`[GET PUBLIC URL] Using CDN: ${url}`);
+    return url;
   }
   
   // Default public URLs
   if (IS_AWS_S3) {
     // AWS S3 public URL format
-    return `https://${bucketName}.s3.${DO_SPACES_REGION}.amazonaws.com/${objectName}`;
+    url = `https://${bucketName}.s3.${DO_SPACES_REGION}.amazonaws.com/${objectName}`;
+    console.log(`[GET PUBLIC URL] Using AWS S3 direct URL: ${url}`);
+    return url;
   } else {
     // DO Spaces public URL format
-    return `https://${bucketName}.${DO_SPACES_ENDPOINT}/${objectName}`;
+    url = `https://${bucketName}.${DO_SPACES_ENDPOINT}/${objectName}`;
+    console.log(`[GET PUBLIC URL] Using DO Spaces URL: ${url}`);
+    return url;
   }
 };
 
@@ -899,12 +907,25 @@ app.post('/posts', authenticate, async (req, res) => {
   const processingStatus = type === 'VIDEO' ? 'PENDING' : 'COMPLETED';
 
   try {
+    // Log the URLs being stored to verify AWS S3 paths
+    console.log(`[CREATE POST] Storing post with mediaUrl: ${mediaUrl || 'none'}`);
+    console.log(`[CREATE POST] Storing post with thumbnailUrl: ${thumbnailUrl || 'none'}`);
+    
     const result = await pool.query(
       `INSERT INTO posts (user_id, type, content, media_url, thumbnail_url, processing_status)
        VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
       [req.user.id, type, content, mediaUrl, thumbnailUrl, processingStatus]
     );
+    
+    // Verify what was actually stored
+    const verifyResult = await pool.query(
+      `SELECT id, media_url, thumbnail_url FROM posts WHERE id = $1`,
+      [result.rows[0].id]
+    );
     console.log(`[CREATE POST] Post created successfully, ID: ${result.rows[0].id}`);
+    console.log(`[CREATE POST] Stored media_url in DB: ${verifyResult.rows[0].media_url || 'NULL'}`);
+    console.log(`[CREATE POST] Stored thumbnail_url in DB: ${verifyResult.rows[0].thumbnail_url || 'NULL'}`);
+    
     res.json({ success: true, postId: result.rows[0].id });
   } catch (err) {
     console.error(`[CREATE POST] Error:`, err.message);
@@ -937,13 +958,19 @@ app.post('/upload/presigned', authenticate, async (req, res) => {
     
     if (useMultipart) {
       // Initiate multipart upload for chunked uploads (Instagram-like)
-      const createMultipartCommand = new CreateMultipartUploadCommand({
+      const multipartParams = {
         Bucket: bucketName,
         Key: objectName,
         ContentType: contentType || (fileType === 'image' ? 'image/jpeg' : 'video/mp4'),
         CacheControl: 'public, max-age=31536000',
-        ACL: 'public-read', // Make publicly readable
-      });
+      };
+      
+      // Only add ACL if not using AWS S3 (AWS S3 may have ACLs disabled, bucket policy handles public access)
+      if (!IS_AWS_S3) {
+        multipartParams.ACL = 'public-read';
+      }
+      
+      const createMultipartCommand = new CreateMultipartUploadCommand(multipartParams);
       
       const multipartResponse = await s3Client.send(createMultipartCommand);
       const uploadId = multipartResponse.UploadId;
@@ -979,13 +1006,19 @@ app.post('/upload/presigned', authenticate, async (req, res) => {
       });
     } else {
       // For small files, use simple presigned PUT URL
-      const putObjectCommand = new PutObjectCommand({
+      const putParams = {
         Bucket: bucketName,
         Key: objectName,
         ContentType: contentType || (fileType === 'image' ? 'image/jpeg' : 'video/mp4'),
         CacheControl: 'public, max-age=31536000',
-        ACL: 'public-read',
-      });
+      };
+      
+      // Only add ACL if not using AWS S3 (AWS S3 may have ACLs disabled, bucket policy handles public access)
+      if (!IS_AWS_S3) {
+        putParams.ACL = 'public-read';
+      }
+      
+      const putObjectCommand = new PutObjectCommand(putParams);
       
       const uploadUrl = await getSignedUrl(s3Client, putObjectCommand, { expiresIn: PRESIGNED_URL_EXPIRY });
       const publicUrl = getPublicUrl(bucketName, objectName);
@@ -1099,25 +1132,36 @@ app.post('/upload/direct', authenticate, upload.single('file'), async (req, res)
     
     console.log(`[DIRECT UPLOAD] Uploading file: ${objectName}, size: ${file.size} bytes, type: ${file.mimetype}`);
     
-    // Upload to DO Spaces (S3-compatible)
-    const putCommand = new PutObjectCommand({
+    // Upload to AWS S3 or DO Spaces
+    const putParams = {
       Bucket: bucketName,
       Key: objectName,
       Body: file.buffer,
       ContentType: file.mimetype,
       CacheControl: 'public, max-age=31536000',
-      ACL: 'public-read', // Make publicly readable
-    });
+    };
+    
+    // Only add ACL if not using AWS S3 (AWS S3 may have ACLs disabled, bucket policy handles public access)
+    if (!IS_AWS_S3) {
+      putParams.ACL = 'public-read';
+    }
+    
+    const putCommand = new PutObjectCommand(putParams);
     
     await s3Client.send(putCommand);
     
-    // Get public URL
+    // Get public URL (CloudFront CDN or direct S3 URL)
     const publicUrl = getPublicUrl(bucketName, objectName);
     
-    console.log(`[DIRECT UPLOAD] File uploaded successfully: ${objectName}, URL: ${publicUrl}`);
+    console.log(`[DIRECT UPLOAD] File uploaded successfully: ${objectName}`);
+    console.log(`[DIRECT UPLOAD] Bucket: ${bucketName}, Object: ${objectName}`);
+    console.log(`[DIRECT UPLOAD] Public URL returned to client: ${publicUrl}`);
+    console.log(`[DIRECT UPLOAD] Using ${IS_AWS_S3 ? 'AWS S3' : 'DO Spaces'} storage`);
+    console.log(`[DIRECT UPLOAD] CDN URL: ${DO_SPACES_CDN_URL || 'Not configured'}`);
+    
     res.json({
       success: true,
-      url: publicUrl,
+      url: publicUrl, // This URL will be stored in database by frontend
       bucket: bucketName,
       objectName,
       type: isImage ? 'image' : 'video',
@@ -3743,4 +3787,3 @@ app.listen(PORT, '0.0.0.0', async () => {
     // Wait a bit for DB to be ready in Docker
     setTimeout(initDb, 5000);
 });
-
