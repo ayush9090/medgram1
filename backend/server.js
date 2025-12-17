@@ -820,6 +820,9 @@ app.get('/feed', async (req, res) => {
       )`;
       params.push(currentUserId);
       paramCount++;
+      
+      // Log for debugging
+      console.log(`[FEED] Privacy filter applied: currentUserId=${currentUserId}, paramCount=${paramCount}`);
     } else {
       // Not logged in - only show public posts
       query += ` AND u.account_privacy = 'PUBLIC'`;
@@ -865,6 +868,14 @@ app.get('/feed', async (req, res) => {
     }));
     
     console.log(`[FEED] Returning ${posts.length} posts`);
+    
+    // Log media URLs for debugging
+    posts.forEach((post, idx) => {
+      console.log(`[FEED] Post ${idx + 1} (ID: ${post.id}, Type: ${post.type}):`);
+      console.log(`[FEED]   mediaUrl: ${post.mediaUrl || 'NULL'}`);
+      console.log(`[FEED]   thumbnailUrl: ${post.thumbnailUrl || 'NULL'}`);
+    });
+    
     res.json({
       posts,
       pagination: {
@@ -902,9 +913,9 @@ app.post('/posts', authenticate, async (req, res) => {
   
   // MODERATOR and CREATOR: Can post both THREAD and VIDEO
 
-  // Videos start as PENDING and are processed to HLS by the worker
-  // This enables chunked streaming like Instagram
-  const processingStatus = type === 'VIDEO' ? 'PENDING' : 'COMPLETED';
+  // For regular MP4 videos, mark as COMPLETED immediately (no HLS processing needed)
+  // Only mark as PENDING if you're planning to transcode to HLS
+  const processingStatus = 'COMPLETED'; // Changed: Show videos immediately like Instagram
 
   try {
     // Log the URLs being stored to verify AWS S3 paths
@@ -3317,8 +3328,18 @@ app.get('/activity', authenticate, async (req, res) => {
   
   console.log(`[ACTIVITY] Fetching activity for user: ${userId}, page: ${page}, limit: ${limit}`);
   
+  // Helper function to fix old MinIO URLs to CloudFront
+  const fixUrl = (url) => {
+    if (!url) return url;
+    // Replace old MinIO URLs with CloudFront
+    if (url.includes('74.208.158.126:9000')) {
+      return url.replace('http://74.208.158.126:9000/', 'https://d2sfmoef7qs2f4.cloudfront.net/');
+    }
+    return url;
+  };
+  
   try {
-    // Get likes on user's posts
+    // Get likes on user's posts (exclude deleted/broken posts)
     const likesQuery = await pool.query(`
       SELECT 
         l.created_at as timestamp,
@@ -3335,10 +3356,13 @@ app.get('/activity', authenticate, async (req, res) => {
       JOIN users u ON l.user_id = u.id
       JOIN posts p ON l.post_id = p.id
       WHERE p.user_id = $1
+        AND p.media_url IS NOT NULL
+        AND p.media_url != ''
+        AND p.media_url NOT LIKE '%74.208.158.126:9000%'
       ORDER BY l.created_at DESC
     `, [userId]);
     
-    // Get comments on user's posts (only top-level comments, not replies)
+    // Get comments on user's posts (only top-level comments, not replies, exclude deleted/broken posts)
     const commentsQuery = await pool.query(`
       SELECT 
         c.created_at as timestamp,
@@ -3355,7 +3379,11 @@ app.get('/activity', authenticate, async (req, res) => {
       FROM comments c
       JOIN users u ON c.user_id = u.id
       JOIN posts p ON c.post_id = p.id
-      WHERE p.user_id = $1 AND (c.parent_comment_id IS NULL)
+      WHERE p.user_id = $1 
+        AND (c.parent_comment_id IS NULL)
+        AND p.media_url IS NOT NULL
+        AND p.media_url != ''
+        AND p.media_url NOT LIKE '%74.208.158.126:9000%'
       ORDER BY c.created_at DESC
     `, [userId]);
     
@@ -3380,9 +3408,20 @@ app.get('/activity', authenticate, async (req, res) => {
     `, [userId]);
     
     // Combine all activities and sort by timestamp
+    // Fix old MinIO URLs to CloudFront URLs
     const activities = [
-      ...likesQuery.rows.map(row => ({ ...row, type: 'like' })),
-      ...commentsQuery.rows.map(row => ({ ...row, type: 'comment' })),
+      ...likesQuery.rows.map(row => ({ 
+        ...row, 
+        type: 'like',
+        post_media_url: fixUrl(row.post_media_url),
+        post_thumbnail_url: fixUrl(row.post_thumbnail_url)
+      })),
+      ...commentsQuery.rows.map(row => ({ 
+        ...row, 
+        type: 'comment',
+        post_media_url: fixUrl(row.post_media_url),
+        post_thumbnail_url: fixUrl(row.post_thumbnail_url)
+      })),
       ...followsQuery.rows.map(row => ({ ...row, type: 'follow' }))
     ].sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
     
