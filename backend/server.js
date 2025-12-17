@@ -42,7 +42,30 @@ const logger = (req, res, next) => {
 
 app.use(logger);
 app.use(express.json());
-app.use(cors());
+
+// --- CORS (lock API to your frontend domain) ---
+// Set FRONTEND_ORIGIN in .env in production, e.g.
+// FRONTEND_ORIGIN=https://app.medgram.com
+const FRONTEND_ORIGIN = process.env.FRONTEND_ORIGIN || 'http://localhost:5173';
+
+const corsOptions = {
+  origin(origin, callback) {
+    // Allow server-to-server or curl (no Origin header)
+    if (!origin) {
+      return callback(null, true);
+    }
+    if (origin === FRONTEND_ORIGIN) {
+      return callback(null, true);
+    }
+    console.log(`[CORS] Blocked origin: ${origin}`);
+    return callback(new Error('Not allowed by CORS'));
+  },
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+};
+
+app.use(cors(corsOptions));
 
 // --- CONFIGURATION (All Dynamic) ---
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret';
@@ -501,7 +524,7 @@ app.post('/auth/login', async (req, res) => {
       console.log(`[LOGIN] Invalid credentials for user: ${username}`);
       return res.status(401).json({ error: 'Invalid credentials' });
     }
-    
+
     // Check if email is verified (for email-based accounts)
     if (user.email && !user.email_verified) {
       return res.status(403).json({ 
@@ -860,9 +883,9 @@ app.get('/feed', async (req, res) => {
       }
       
       return {
-        ...row,
+      ...row,
         comments: [], // Comments fetched separately
-        timestamp: new Date(row.timestamp).getTime(),
+      timestamp: new Date(row.timestamp).getTime(),
         likedByCurrentUser
       };
     }));
@@ -1206,6 +1229,146 @@ app.get('/health', async (req, res) => {
   }
 });
 
+// 7a. GET FOLLOWERS LIST (must be before /users/:id to avoid route conflict)
+app.get('/users/:id/followers', async (req, res) => {
+  const { id: userId } = req.params;
+  const token = req.headers.authorization?.split(' ')[1];
+  let currentUserId = null;
+  
+  if (token) {
+    try {
+      const decoded = jwt.verify(token, JWT_SECRET);
+      currentUserId = decoded.id;
+    } catch (err) {
+      // Invalid token, continue without authentication
+    }
+  }
+  
+  console.log(`[FOLLOWERS] Fetching followers for user: ${userId}`);
+  
+  try {
+    // Get users who follow this user (followers)
+    let query = `
+      SELECT 
+        u.id,
+        u.username,
+        u.full_name,
+        u.avatar_url,
+        u.verified,
+        u.role,
+        f.created_at as followed_at
+    `;
+    
+    if (currentUserId) {
+      query += `,
+        (SELECT COUNT(*) FROM follows WHERE follower_id = $2 AND following_id = u.id) > 0 as is_following
+      `;
+    } else {
+      query += `, false as is_following`;
+    }
+    
+    query += `
+      FROM follows f
+      JOIN users u ON f.follower_id = u.id
+      WHERE f.following_id = $1
+      ORDER BY f.created_at DESC
+    `;
+    
+    const params = [userId];
+    if (currentUserId) {
+      params.push(currentUserId);
+    }
+    
+    const result = await pool.query(query, params);
+    
+    const users = result.rows.map(row => ({
+      id: row.id,
+      username: row.username,
+      full_name: row.full_name,
+      avatar_url: row.avatar_url,
+      verified: row.verified,
+      role: row.role,
+      isFollowing: row.is_following || false
+    }));
+    
+    console.log(`[FOLLOWERS] Returning ${users.length} followers for user ${userId}`);
+    res.json({ users });
+  } catch (err) {
+    console.error(`[FOLLOWERS] Error:`, err.message);
+    res.status(500).json({ error: 'Could not fetch followers' });
+  }
+});
+
+// 7b. GET FOLLOWING LIST (must be before /users/:id to avoid route conflict)
+app.get('/users/:id/following', async (req, res) => {
+  const { id: userId } = req.params;
+  const token = req.headers.authorization?.split(' ')[1];
+  let currentUserId = null;
+  
+  if (token) {
+    try {
+      const decoded = jwt.verify(token, JWT_SECRET);
+      currentUserId = decoded.id;
+    } catch (err) {
+      // Invalid token, continue without authentication
+    }
+  }
+  
+  console.log(`[FOLLOWING] Fetching following for user: ${userId}`);
+  
+  try {
+    // Get users this user follows (following)
+    let query = `
+      SELECT 
+        u.id,
+        u.username,
+        u.full_name,
+        u.avatar_url,
+        u.verified,
+        u.role,
+        f.created_at as followed_at
+    `;
+    
+    if (currentUserId) {
+      query += `,
+        (SELECT COUNT(*) FROM follows WHERE follower_id = $2 AND following_id = u.id) > 0 as is_following
+      `;
+    } else {
+      query += `, false as is_following`;
+    }
+    
+    query += `
+      FROM follows f
+      JOIN users u ON f.following_id = u.id
+      WHERE f.follower_id = $1
+      ORDER BY f.created_at DESC
+    `;
+    
+    const params = [userId];
+    if (currentUserId) {
+      params.push(currentUserId);
+    }
+    
+    const result = await pool.query(query, params);
+    
+    const users = result.rows.map(row => ({
+      id: row.id,
+      username: row.username,
+      full_name: row.full_name,
+      avatar_url: row.avatar_url,
+      verified: row.verified,
+      role: row.role,
+      isFollowing: row.is_following || false
+    }));
+    
+    console.log(`[FOLLOWING] Returning ${users.length} following for user ${userId}`);
+    res.json({ users });
+  } catch (err) {
+    console.error(`[FOLLOWING] Error:`, err.message);
+    res.status(500).json({ error: 'Could not fetch following' });
+  }
+});
+
 // 7. GET USER PROFILE (with stats)
 app.get('/users/:id', async (req, res) => {
   const { id } = req.params;
@@ -1315,7 +1478,7 @@ app.get('/users/:id', async (req, res) => {
   }
 });
 
-// 7b. UPDATE USER PROFILE (auth required)
+// 7c. UPDATE USER PROFILE (auth required)
 app.put('/users/:id', authenticate, async (req, res) => {
   const { id: userId } = req.params;
   const { fullName, avatarUrl, bio, email, phone } = req.body;
@@ -3501,7 +3664,7 @@ app.post('/admin/verify-user/:id', authenticate, async (req, res) => {
   
   try {
     const userResult = await pool.query(
-      'SELECT verification_code FROM users WHERE id = $1',
+      'SELECT id, verification_code, verified FROM users WHERE id = $1',
       [userId]
     );
     
@@ -3511,17 +3674,24 @@ app.post('/admin/verify-user/:id', authenticate, async (req, res) => {
     
     const user = userResult.rows[0];
     
-    if (verificationCode && user.verification_code !== verificationCode) {
+    // If user is already verified, return success
+    if (user.verified) {
+      console.log(`[VERIFY USER] User ${userId} is already verified`);
+      return res.json({ success: true, message: 'User is already verified' });
+    }
+    
+    // If verification code provided, validate it
+    if (verificationCode && user.verification_code && user.verification_code !== verificationCode) {
       return res.status(400).json({ error: 'Invalid verification code' });
     }
     
-    // Verify user
+    // Verify user (set verified = true, clear verification_code)
     await pool.query(
       'UPDATE users SET verified = true, verification_code = NULL WHERE id = $1',
       [userId]
     );
     
-    console.log(`[VERIFY USER] User ${userId} verified successfully`);
+    console.log(`[VERIFY USER] User ${userId} verified successfully by moderator ${req.user.id}`);
     res.json({ success: true, message: 'User verified successfully' });
   } catch (err) {
     console.error(`[VERIFY USER] Error:`, err.message);
