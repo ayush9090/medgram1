@@ -44,9 +44,16 @@ app.use(logger);
 app.use(express.json());
 
 // --- CORS (lock API to your frontend domain) ---
-// Set FRONTEND_ORIGIN in .env in production, e.g.
+// In production, set FRONTEND_ORIGIN to your real frontend, e.g.
 // FRONTEND_ORIGIN=https://app.medgram.com
-const FRONTEND_ORIGIN = process.env.FRONTEND_ORIGIN || 'http://localhost:3000';
+const FRONTEND_ORIGIN = process.env.FRONTEND_ORIGIN || '';
+
+// Always allow common local dev ports, plus the configured origin
+const allowedOrigins = [
+  'http://localhost:3000',
+  'http://localhost:5173',
+  FRONTEND_ORIGIN,
+].filter(Boolean);
 
 const corsOptions = {
   origin(origin, callback) {
@@ -54,7 +61,7 @@ const corsOptions = {
     if (!origin) {
       return callback(null, true);
     }
-    if (origin === FRONTEND_ORIGIN) {
+    if (allowedOrigins.includes(origin)) {
       return callback(null, true);
     }
     console.log(`[CORS] Blocked origin: ${origin}`);
@@ -926,15 +933,33 @@ app.post('/posts', authenticate, async (req, res) => {
     return res.status(403).json({ error: 'View-Only users cannot create posts' });
   }
   
+  // Normalize and validate post type
+  const normalizedType = (type || '').toUpperCase();
+  const allowedTypes = ['THREAD', 'VIDEO'];
+  if (!allowedTypes.includes(normalizedType)) {
+    return res.status(400).json({ error: 'Invalid post type' });
+  }
+
   // USER: Can post THREAD but NOT VIDEO
-  if (type === 'VIDEO' && userRole === 'USER') {
+  if (normalizedType === 'VIDEO' && userRole === 'USER') {
     console.log(`[CREATE POST] Permission denied - USER cannot post videos`);
     return res.status(403).json({ 
       error: 'Standard users cannot post videos. Only Creators and Moderators can post videos.' 
     });
   }
-  
-  // MODERATOR and CREATOR: Can post both THREAD and VIDEO
+
+  // THREAD posts are text-only (no media)
+  if (normalizedType === 'THREAD' && (mediaUrl || thumbnailUrl)) {
+    console.log(`[CREATE POST] Invalid THREAD post with media by user ${req.user.id}`);
+    return res.status(400).json({ 
+      error: 'Threads are text-only and cannot include photos or videos.' 
+    });
+  }
+
+  // VIDEO posts must have media
+  if (normalizedType === 'VIDEO' && !mediaUrl) {
+    return res.status(400).json({ error: 'Video posts require a video file.' });
+  }
 
   // For regular MP4 videos, mark as COMPLETED immediately (no HLS processing needed)
   // Only mark as PENDING if you're planning to transcode to HLS
@@ -948,7 +973,7 @@ app.post('/posts', authenticate, async (req, res) => {
     const result = await pool.query(
       `INSERT INTO posts (user_id, type, content, media_url, thumbnail_url, processing_status)
        VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
-      [req.user.id, type, content, mediaUrl, thumbnailUrl, processingStatus]
+      [req.user.id, normalizedType, content, mediaUrl, thumbnailUrl, processingStatus]
     );
     
     // Verify what was actually stored
