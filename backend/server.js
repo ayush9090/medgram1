@@ -46,7 +46,7 @@ app.use(express.json());
 // --- CORS (lock API to your frontend domain) ---
 // Set FRONTEND_ORIGIN in .env in production, e.g.
 // FRONTEND_ORIGIN=https://app.medgram.com
-const FRONTEND_ORIGIN = process.env.FRONTEND_ORIGIN || 'http://localhost:5173';
+const FRONTEND_ORIGIN = process.env.FRONTEND_ORIGIN || 'http://localhost:3000';
 
 const corsOptions = {
   origin(origin, callback) {
