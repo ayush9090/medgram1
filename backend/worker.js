@@ -6,7 +6,7 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 
-console.log("Worker Service Starting...");
+console.log("[WORKER] Worker Service Starting...");
 
 // --- CONFIGURATION ---
 // Supports both AWS S3 and DigitalOcean Spaces
@@ -29,6 +29,16 @@ const pool = new Pool({
 });
 
 // --- STORAGE CONNECTION (AWS S3 or DigitalOcean Spaces) ---
+if (IS_AWS_S3) {
+  console.log(`[WORKER] Using AWS S3 (Industry-standard)`);
+  console.log(`[WORKER] Region: ${DO_SPACES_REGION}`);
+} else {
+  console.log(`[WORKER] Using DigitalOcean Spaces`);
+  console.log(`[WORKER] Endpoint: ${DO_SPACES_ENDPOINT}`);
+  console.log(`[WORKER] Region: ${DO_SPACES_REGION}`);
+}
+console.log(`[WORKER] Key: ${DO_SPACES_KEY ? 'Set' : 'Not set'}`);
+
 const s3ClientConfig = {
   region: DO_SPACES_REGION,
   credentials: {
@@ -46,6 +56,12 @@ if (!IS_AWS_S3 && DO_SPACES_ENDPOINT) {
 
 const s3Client = new S3Client(s3ClientConfig);
 
+if (IS_AWS_S3) {
+  console.log(`[WORKER] AWS S3 client initialized successfully`);
+} else {
+  console.log(`[WORKER] DigitalOcean Spaces client initialized successfully`);
+}
+
 // Helper function to get public URL
 const getPublicUrl = (bucketName, objectName) => {
   if (DO_SPACES_CDN_URL) {
@@ -57,10 +73,14 @@ const getPublicUrl = (bucketName, objectName) => {
   return `https://${bucketName}.${DO_SPACES_ENDPOINT}/${objectName}`;
 };
 
-// Ensure HLS bucket exists (buckets must be created via DO console/API)
+// Ensure HLS bucket exists (buckets must be created via AWS/DO console)
 const ensureBucket = async () => {
-  console.log(`Using HLS bucket: ${HLS_BUCKET}`);
-  // Note: Buckets should be created via DigitalOcean console
+  if (IS_AWS_S3) {
+    console.log(`[WORKER] Using AWS S3 HLS bucket: ${HLS_BUCKET}`);
+  } else {
+    console.log(`[WORKER] Using DO Spaces HLS bucket: ${HLS_BUCKET}`);
+  }
+  // Note: Buckets should be created via AWS Console or DigitalOcean console
 };
 
 // Process a single video
