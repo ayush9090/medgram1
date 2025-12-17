@@ -2570,11 +2570,16 @@ app.get('/conversations', authenticate, async (req, res) => {
           ELSE u1.username
         END as other_username,
         CASE 
+          WHEN c.user1_id = $1 THEN COALESCE(u2.full_name, u2.username)
+          ELSE COALESCE(u1.full_name, u1.username)
+        END as other_full_name,
+        CASE 
           WHEN c.user1_id = $1 THEN u2.avatar_url
           ELSE u1.avatar_url
         END as other_avatar,
         (SELECT content FROM messages WHERE conversation_id = c.id ORDER BY created_at DESC LIMIT 1) as last_message,
-        (SELECT COUNT(*) FROM messages WHERE conversation_id = c.id AND sender_id != $1 AND is_read = FALSE) as unread_count
+        (SELECT COUNT(*) FROM messages WHERE conversation_id = c.id AND sender_id != $1 AND is_read = FALSE) as unread_count,
+        (SELECT status FROM messages WHERE conversation_id = c.id AND sender_id = $1 ORDER BY created_at DESC LIMIT 1) as last_message_status
       FROM conversations c
       JOIN users u1 ON c.user1_id = u1.id
       JOIN users u2 ON c.user2_id = u2.id
@@ -2609,7 +2614,7 @@ app.get('/conversations/:conversationId/messages', authenticate, async (req, res
     }
     
     const result = await pool.query(`
-      SELECT m.id, m.content, m.media_url, m.is_read, m.created_at,
+      SELECT m.id, m.content, m.media_url, m.is_read, m.status, m.seen_at, m.created_at,
              u.id as sender_id, u.username as sender_username, u.avatar_url as sender_avatar
       FROM messages m
       JOIN users u ON m.sender_id = u.id
@@ -2618,8 +2623,20 @@ app.get('/conversations/:conversationId/messages', authenticate, async (req, res
       LIMIT $2 OFFSET $3
     `, [conversationId, limit, offset]);
     
+    // Mark messages as read and seen when user views them (Instagram-like read receipts)
+    // Only update status to SEEN for messages sent by the other user (not your own messages)
     await pool.query(
-      'UPDATE messages SET is_read = TRUE WHERE conversation_id = $1 AND sender_id != $2 AND is_read = FALSE',
+      `UPDATE messages 
+       SET is_read = TRUE, 
+           status = CASE 
+             WHEN sender_id != $2 AND status != 'SEEN' THEN 'SEEN' 
+             ELSE status 
+           END,
+           seen_at = CASE 
+             WHEN sender_id != $2 AND seen_at IS NULL THEN CURRENT_TIMESTAMP 
+             ELSE seen_at 
+           END
+       WHERE conversation_id = $1 AND sender_id != $2 AND is_read = FALSE`,
       [conversationId, userId]
     );
     
@@ -2627,6 +2644,38 @@ app.get('/conversations/:conversationId/messages', authenticate, async (req, res
   } catch (err) {
     console.error(`[MESSAGES] Error:`, err.message);
     res.status(500).json({ error: 'Could not fetch messages' });
+  }
+});
+
+// 25a. MARK MESSAGES AS SEEN (Read Receipts)
+app.post('/conversations/:conversationId/messages/seen', authenticate, async (req, res) => {
+  const { conversationId } = req.params;
+  const userId = req.user.id;
+  
+  try {
+    const convCheck = await pool.query(
+      'SELECT * FROM conversations WHERE id = $1 AND (user1_id = $2 OR user2_id = $2)',
+      [conversationId, userId]
+    );
+    
+    if (convCheck.rows.length === 0) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+    
+    // Mark all unread messages from the other user as seen (Instagram-like read receipts)
+    await pool.query(
+      `UPDATE messages 
+       SET is_read = TRUE, 
+           status = CASE WHEN status != 'SEEN' THEN 'SEEN' ELSE status END,
+           seen_at = CASE WHEN seen_at IS NULL THEN CURRENT_TIMESTAMP ELSE seen_at END
+       WHERE conversation_id = $1 AND sender_id != $2 AND (status != 'SEEN' OR is_read = FALSE)`,
+      [conversationId, userId]
+    );
+    
+    res.json({ success: true });
+  } catch (err) {
+    console.error(`[MARK SEEN] Error:`, err.message);
+    res.status(500).json({ error: 'Could not mark messages as seen' });
   }
 });
 
@@ -2676,18 +2725,32 @@ app.post('/conversations/:conversationId/messages', authenticate, async (req, re
       });
     }
     
+    // Insert message with SENDING status initially (Instagram-like)
     const result = await pool.query(`
-      INSERT INTO messages (conversation_id, sender_id, content, media_url)
-      VALUES ($1, $2, $3, $4)
-      RETURNING id, content, media_url, created_at
+      INSERT INTO messages (conversation_id, sender_id, content, media_url, status)
+      VALUES ($1, $2, $3, $4, 'SENDING')
+      RETURNING id, content, media_url, status, created_at
     `, [conversationId, userId, content || null, mediaUrl || null]);
+    
+    // Immediately update to DELIVERED (message was successfully saved)
+    await pool.query(`
+      UPDATE messages 
+      SET status = 'DELIVERED'
+      WHERE id = $1
+    `, [result.rows[0].id]);
     
     await pool.query(
       'UPDATE conversations SET last_message_at = CURRENT_TIMESTAMP WHERE id = $1',
       [conversationId]
     );
     
-    res.json({ ...result.rows[0], sender_id: userId });
+    // Return message with DELIVERED status
+    const messageResult = await pool.query(
+      'SELECT id, content, media_url, status, created_at FROM messages WHERE id = $1',
+      [result.rows[0].id]
+    );
+    
+    res.json({ ...messageResult.rows[0], sender_id: userId });
   } catch (err) {
     console.error(`[SEND MESSAGE] Error:`, err.message);
     res.status(500).json({ error: 'Could not send message' });
@@ -2737,14 +2800,34 @@ app.post('/conversations', authenticate, async (req, res) => {
     const theyFollowMe = parseInt(followCheck.rows[0].they_follow_me) > 0;
     const mutualFollow = iFollowThem && theyFollowMe;
     
-    // Check messaging permissions
+    // Instagram-like logic: Direct message if:
+    // 1. Users follow each other (mutual follow), OR
+    // 2. Account is public, OR
+    // 3. Messaging permissions allow it
     let canMessageDirectly = false;
-    if (whoCanMessage === 'EVERYONE') {
+    
+    // Priority 1: Mutual follow → always direct (no pending request)
+    if (mutualFollow) {
       canMessageDirectly = true;
+      console.log(`[START CONVERSATION] Mutual follow detected - direct messaging allowed`);
+    }
+    // Priority 2: Public account → direct (no pending request)
+    else if (accountPrivacy === 'PUBLIC') {
+      canMessageDirectly = true;
+      console.log(`[START CONVERSATION] Public account - direct messaging allowed`);
+    }
+    // Priority 3: Check messaging permissions
+    else if (whoCanMessage === 'EVERYONE') {
+      canMessageDirectly = true;
+      console.log(`[START CONVERSATION] Messaging permissions: EVERYONE - direct messaging allowed`);
     } else if (whoCanMessage === 'FOLLOWERS' && theyFollowMe) {
       canMessageDirectly = true;
+      console.log(`[START CONVERSATION] They follow me and messaging is for FOLLOWERS - direct messaging allowed`);
     } else if (whoCanMessage === 'FOLLOWING' && iFollowThem) {
       canMessageDirectly = true;
+      console.log(`[START CONVERSATION] I follow them and messaging is for FOLLOWING - direct messaging allowed`);
+    } else {
+      console.log(`[START CONVERSATION] Cannot message directly - will create message request`);
     }
     
     // Check for existing conversation
@@ -3819,6 +3902,8 @@ const initDb = async () => {
                 content TEXT,
                 media_url TEXT,
                 is_read BOOLEAN DEFAULT FALSE,
+                status VARCHAR(20) DEFAULT 'DELIVERED',
+                seen_at TIMESTAMP,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
             CREATE TABLE IF NOT EXISTS stories (
@@ -3870,6 +3955,20 @@ const initDb = async () => {
             ALTER TABLE users ADD COLUMN IF NOT EXISTS phone VARCHAR(50);
             ALTER TABLE users ADD COLUMN IF NOT EXISTS state_license VARCHAR(50);
             ALTER TABLE users ADD COLUMN IF NOT EXISTS verification_code VARCHAR(10);
+            
+            -- Add message status columns if they don't exist (migration for existing tables)
+            DO $$ 
+            BEGIN
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
+                               WHERE table_name='messages' AND column_name='status') THEN
+                    ALTER TABLE messages ADD COLUMN status VARCHAR(20) DEFAULT 'DELIVERED';
+                END IF;
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
+                               WHERE table_name='messages' AND column_name='seen_at') THEN
+                    ALTER TABLE messages ADD COLUMN seen_at TIMESTAMP;
+                END IF;
+            END $$;
+            
             ALTER TABLE users ADD COLUMN IF NOT EXISTS user_type VARCHAR(20);
             ALTER TABLE users ADD COLUMN IF NOT EXISTS two_factor_enabled BOOLEAN DEFAULT FALSE;
             ALTER TABLE users ADD COLUMN IF NOT EXISTS two_factor_secret VARCHAR(255);
