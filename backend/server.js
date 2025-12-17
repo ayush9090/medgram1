@@ -1,6 +1,6 @@
 const express = require('express');
 const { Pool } = require('pg');
-const { S3Client, PutObjectCommand, GetObjectCommand, CreateMultipartUploadCommand, UploadPartCommand, CompleteMultipartUploadCommand, ListPartsCommand } = require('@aws-sdk/client-s3');
+const { S3Client, PutObjectCommand, GetObjectCommand, CreateMultipartUploadCommand, UploadPartCommand, CompleteMultipartUploadCommand, ListPartsCommand, DeleteObjectCommand } = require('@aws-sdk/client-s3');
 const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 const cors = require('cors');
 const jwt = require('jsonwebtoken');
@@ -579,11 +579,44 @@ app.post('/auth/login', async (req, res) => {
       username: user.username || user.email || user.phone,
       fullName: user.full_name || user.username || user.email || user.phone
     };
+    
     console.log(`[LOGIN] Successful login for user: ${username}, role: ${user.role}`);
     res.json({ user: userResponse, token });
   } catch (err) {
     console.error(`[LOGIN] Error:`, err.message);
     res.status(500).json({ error: 'Internal error' });
+  }
+});
+
+// 2a. GET CURRENT USER (Auto-login on refresh)
+app.get('/auth/me', authenticate, async (req, res) => {
+  const userId = req.user.id;
+  console.log(`[AUTH ME] Fetching current user: ${userId}`);
+  
+  try {
+    const result = await pool.query(
+      `SELECT id, username, email, phone, full_name, role, avatar_url, verified, created_at, 
+              npi_number, state_license, user_type, bio, account_privacy, who_can_follow, who_can_message
+       FROM users WHERE id = $1`,
+      [userId]
+    );
+    
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    
+    const user = result.rows[0];
+    const userResponse = {
+      ...user,
+      username: user.username || user.email || user.phone,
+      fullName: user.full_name || user.username || user.email || user.phone
+    };
+    
+    console.log(`[AUTH ME] Returning user: ${userResponse.username}`);
+    res.json({ user: userResponse });
+  } catch (err) {
+    console.error(`[AUTH ME] Error:`, err.message);
+    res.status(500).json({ error: 'Could not fetch user' });
   }
 });
 
@@ -2346,20 +2379,60 @@ app.delete('/posts/:id', authenticate, async (req, res) => {
     }
     
     const post = postResult.rows[0];
-    if (post.user_id !== userId && req.user.role !== 'MODERATOR') {
-      console.log(`[DELETE POST] Permission denied`);
-      return res.status(403).json({ error: 'Permission denied' });
+    // Allow deletion if user owns the post OR is MODERATOR/ADMIN
+    if (post.user_id !== userId && req.user.role !== 'MODERATOR' && req.user.role !== 'ADMIN') {
+      console.log(`[DELETE POST] Permission denied - User ${userId} cannot delete post ${postId}`);
+      return res.status(403).json({ error: 'Permission denied. You can only delete your own posts.' });
     }
     
-    // Delete associated data
-    await pool.query('DELETE FROM likes WHERE post_id = $1', [postId]);
+    // Delete media files from S3 before deleting the post
+    if (post.media_url) {
+      try {
+        // Extract object name from URL (handles both CloudFront CDN URLs and direct S3 URLs)
+        let objectName = post.media_url;
+        
+        // If it's a CloudFront/CDN URL, extract the path
+        if (post.media_url.includes('cloudfront.net/') || (DO_SPACES_CDN_URL && post.media_url.includes(DO_SPACES_CDN_URL))) {
+          const urlParts = post.media_url.split('/');
+          objectName = urlParts.slice(-2).join('/'); // Get last two parts (userId/filename)
+        } else if (post.media_url.includes('.s3.') || (DO_SPACES_ENDPOINT && post.media_url.includes(DO_SPACES_ENDPOINT))) {
+          // Direct S3/Spaces URL
+          const urlParts = post.media_url.split('/');
+          objectName = urlParts.slice(-2).join('/');
+        }
+        
+        // Determine bucket based on file type
+        let bucketName = DO_SPACES_VIDEOS_BUCKET;
+        if (post.type === 'THREAD' || post.media_url.match(/\.(jpg|jpeg|png|gif|webp)$/i)) {
+          bucketName = DO_SPACES_IMAGES_BUCKET;
+        } else if (post.media_url.match(/\.(mp4|mov|avi|mkv|webm)$/i)) {
+          bucketName = DO_SPACES_VIDEOS_BUCKET;
+        }
+        
+        // Delete main media file
+        const deleteCommand = new DeleteObjectCommand({
+          Bucket: bucketName,
+          Key: objectName
+        });
+        await s3Client.send(deleteCommand);
+        console.log(`[DELETE POST] Deleted media file: ${objectName} from bucket: ${bucketName}`);
+      } catch (mediaErr) {
+        console.error(`[DELETE POST] Error deleting media files:`, mediaErr.message);
+        // Continue with post deletion even if media deletion fails
+      }
+    }
+    
+    // Delete associated data (respecting foreign key constraints)
+    await pool.query('DELETE FROM comment_likes WHERE comment_id IN (SELECT id FROM comments WHERE post_id = $1)', [postId]);
+    await pool.query('DELETE FROM comment_mentions WHERE comment_id IN (SELECT id FROM comments WHERE post_id = $1)', [postId]);
+    await pool.query('DELETE FROM comment_reports WHERE comment_id IN (SELECT id FROM comments WHERE post_id = $1)', [postId]);
     await pool.query('DELETE FROM comments WHERE post_id = $1', [postId]);
+    await pool.query('DELETE FROM likes WHERE post_id = $1', [postId]);
     await pool.query('DELETE FROM saves WHERE post_id = $1', [postId]);
+    await pool.query('DELETE FROM forwards WHERE post_id = $1', [postId]);
     await pool.query('DELETE FROM posts WHERE id = $1', [postId]);
     
-    // TODO: Delete media files from MinIO
-    
-    console.log(`[DELETE POST] Post ${postId} deleted successfully`);
+    console.log(`[DELETE POST] Post ${postId} deleted successfully by user ${userId} (role: ${req.user.role})`);
     res.json({ success: true });
   } catch (err) {
     console.error(`[DELETE POST] Error:`, err.message);
