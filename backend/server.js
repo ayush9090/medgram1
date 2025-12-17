@@ -416,28 +416,34 @@ app.post('/auth/register', async (req, res) => {
       console.log(`[REGISTER] Generated email verification code for ${identifier}`);
     }
     
-    // NPI/License verification requirements (except students and "others")
+    const hashedPassword = await bcrypt.hash(password, 10);
+    const defaultRole = role || 'USER'; // Default to USER if not specified
+    
+    // Auto-verify moderators and admins
     let verified = false;
     let verificationCode = null;
     
-    if (userType !== 'STUDENT' && userType !== 'OTHER') {
-      // Requires NPI or State License verification
-      if (!npiNumber && !stateLicense) {
-        return res.status(400).json({ 
-          error: 'NPI number or State License is required for verification',
-          requiresVerification: true 
-        });
-      }
-      // Generate verification code (to be verified by moderator)
-      verificationCode = Math.random().toString(36).substring(2, 8).toUpperCase();
-      console.log(`[REGISTER] Generated verification code: ${verificationCode} for ${identifier}`);
-    } else {
-      // Students and others don't require NPI verification
+    if (defaultRole === 'MODERATOR' || defaultRole === 'ADMIN') {
       verified = true;
+      console.log(`[REGISTER] Auto-verifying ${defaultRole} user: ${identifier}`);
+    } else {
+      // NPI/License verification requirements (except students and "others")
+      if (userType !== 'STUDENT' && userType !== 'OTHER') {
+        // Requires NPI or State License verification
+        if (!npiNumber && !stateLicense) {
+          return res.status(400).json({ 
+            error: 'NPI number or State License is required for verification',
+            requiresVerification: true 
+          });
+        }
+        // Generate verification code (to be verified by moderator)
+        verificationCode = Math.random().toString(36).substring(2, 8).toUpperCase();
+        console.log(`[REGISTER] Generated verification code: ${verificationCode} for ${identifier}`);
+      } else {
+        // Students and others don't require NPI verification
+        verified = true;
+      }
     }
-    
-    const hashedPassword = await bcrypt.hash(password, 10);
-    const defaultRole = role || 'USER'; // Default to USER if not specified
     
     const privacy = accountPrivacy && ['PUBLIC', 'PRIVATE'].includes(accountPrivacy) ? accountPrivacy : 'PUBLIC';
     
@@ -520,9 +526,9 @@ app.post('/auth/login', async (req, res) => {
   console.log(`[LOGIN] Attempting login for user: ${username}, rememberMe: ${rememberMe || false}`);
   
   try {
-    // Support login with email or phone number
+    // Support login with username (case-insensitive), email, or phone number
     const result = await pool.query(
-      `SELECT * FROM users WHERE username = $1 OR email = $1 OR phone = $1`,
+      `SELECT * FROM users WHERE LOWER(username) = LOWER($1) OR LOWER(email) = LOWER($1) OR phone = $1`,
       [username]
     );
     const user = result.rows[0];
@@ -737,8 +743,9 @@ app.post('/auth/forgot-password', async (req, res) => {
   }
   
   try {
+    // Support case-insensitive email lookup
     const result = await pool.query(
-      'SELECT id FROM users WHERE email = $1',
+      'SELECT id FROM users WHERE LOWER(email) = LOWER($1)',
       [email]
     );
     
@@ -830,6 +837,56 @@ app.post('/auth/reset-password', async (req, res) => {
   } catch (err) {
     console.error(`[RESET PASSWORD] Error:`, err.message);
     res.status(500).json({ error: 'Could not reset password' });
+  }
+});
+
+// 2e. CHANGE PASSWORD (requires current password verification)
+app.post('/auth/change-password', authenticate, async (req, res) => {
+  const { currentPassword, newPassword } = req.body;
+  const userId = req.user.id;
+  
+  console.log(`[CHANGE PASSWORD] User ${userId} attempting to change password`);
+  
+  if (!currentPassword || !newPassword) {
+    return res.status(400).json({ error: 'Current password and new password are required' });
+  }
+  
+  if (newPassword.length < 6) {
+    return res.status(400).json({ error: 'New password must be at least 6 characters' });
+  }
+  
+  try {
+    // Get current user's password hash
+    const result = await pool.query(
+      'SELECT password_hash FROM users WHERE id = $1',
+      [userId]
+    );
+    
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    
+    const user = result.rows[0];
+    
+    // Verify current password
+    const isCurrentPasswordValid = await bcrypt.compare(currentPassword, user.password_hash);
+    if (!isCurrentPasswordValid) {
+      console.log(`[CHANGE PASSWORD] Invalid current password for user: ${userId}`);
+      return res.status(401).json({ error: 'Current password is incorrect' });
+    }
+    
+    // Hash and update new password
+    const hashedPassword = await bcrypt.hash(newPassword, 10);
+    await pool.query(
+      'UPDATE users SET password_hash = $1 WHERE id = $2',
+      [hashedPassword, userId]
+    );
+    
+    console.log(`[CHANGE PASSWORD] Password changed successfully for user: ${userId}`);
+    res.json({ success: true, message: 'Password changed successfully' });
+  } catch (err) {
+    console.error(`[CHANGE PASSWORD] Error:`, err.message);
+    res.status(500).json({ error: 'Could not change password' });
   }
 });
 
@@ -2107,10 +2164,18 @@ app.delete('/comments/:id', authenticate, async (req, res) => {
     
     const comment = commentResult.rows[0];
     
-    // Check permissions: user owns comment, or is post owner, or is moderator
-    if (comment.user_id !== userId && comment.post_owner_id !== userId && userRole !== 'MODERATOR') {
-      return res.status(403).json({ error: 'Permission denied' });
+    // Check permissions: user owns comment, or is post owner, or is moderator/admin
+    if (comment.user_id !== userId && comment.post_owner_id !== userId && userRole !== 'MODERATOR' && userRole !== 'ADMIN') {
+      console.log(`[DELETE COMMENT] Permission denied - User ${userId} cannot delete comment ${commentId}`);
+      return res.status(403).json({ error: 'Permission denied. You can only delete your own comments.' });
     }
+    
+    // Delete related data first (respecting foreign key constraints)
+    await pool.query('DELETE FROM comment_likes WHERE comment_id = $1', [commentId]);
+    await pool.query('DELETE FROM comment_mentions WHERE comment_id = $1', [commentId]);
+    await pool.query('DELETE FROM comment_reports WHERE comment_id = $1', [commentId]);
+    // Delete replies first (child comments)
+    await pool.query('DELETE FROM comments WHERE parent_comment_id = $1', [commentId]);
     
     // Delete comment (cascade will delete likes, mentions, replies)
     await pool.query('DELETE FROM comments WHERE id = $1', [commentId]);
@@ -2370,7 +2435,7 @@ app.delete('/posts/:id', authenticate, async (req, res) => {
   try {
     // Check if user owns the post or is admin
     const postResult = await pool.query(
-      'SELECT user_id, type, media_url FROM posts WHERE id = $1',
+      'SELECT user_id, type, media_url, thumbnail_url FROM posts WHERE id = $1',
       [postId]
     );
     
@@ -2416,6 +2481,33 @@ app.delete('/posts/:id', authenticate, async (req, res) => {
         });
         await s3Client.send(deleteCommand);
         console.log(`[DELETE POST] Deleted media file: ${objectName} from bucket: ${bucketName}`);
+        
+        // Also delete thumbnail if it exists and is different from media_url
+        if (post.thumbnail_url && post.thumbnail_url !== post.media_url) {
+          try {
+            let thumbnailObjectName = post.thumbnail_url;
+            
+            // Extract thumbnail object name from URL
+            if (post.thumbnail_url.includes('cloudfront.net/') || (DO_SPACES_CDN_URL && post.thumbnail_url.includes(DO_SPACES_CDN_URL))) {
+              const thumbParts = post.thumbnail_url.split('/');
+              thumbnailObjectName = thumbParts.slice(-2).join('/');
+            } else if (post.thumbnail_url.includes('.s3.') || (DO_SPACES_ENDPOINT && post.thumbnail_url.includes(DO_SPACES_ENDPOINT))) {
+              const thumbParts = post.thumbnail_url.split('/');
+              thumbnailObjectName = thumbParts.slice(-2).join('/');
+            }
+            
+            const thumbBucketName = DO_SPACES_THUMB_BUCKET || DO_SPACES_IMAGES_BUCKET;
+            const deleteThumbCommand = new DeleteObjectCommand({
+              Bucket: thumbBucketName,
+              Key: thumbnailObjectName
+            });
+            await s3Client.send(deleteThumbCommand);
+            console.log(`[DELETE POST] Deleted thumbnail: ${thumbnailObjectName} from bucket: ${thumbBucketName}`);
+          } catch (thumbErr) {
+            console.error(`[DELETE POST] Error deleting thumbnail:`, thumbErr.message);
+            // Continue even if thumbnail deletion fails
+          }
+        }
       } catch (mediaErr) {
         console.error(`[DELETE POST] Error deleting media files:`, mediaErr.message);
         // Continue with post deletion even if media deletion fails
@@ -3834,6 +3926,246 @@ app.get('/admin/pending-verifications', authenticate, async (req, res) => {
   }
 });
 
+// 17a. SUBMIT VERIFICATION REQUEST (Blue Tick Badge)
+app.post('/verification/request', authenticate, async (req, res) => {
+  const { reason, question1_answer, question2_answer, question3_answer } = req.body;
+  const userId = req.user.id;
+  const userRole = req.user.role;
+  
+  console.log(`[VERIFICATION REQUEST] User ${userId} (role: ${userRole}) submitting verification request`);
+  
+  // Only CREATOR and USER roles can request verification (MODERATOR is auto-verified)
+  if (userRole === 'MODERATOR' || userRole === 'ADMIN') {
+    return res.status(400).json({ error: 'Moderators and Admins are automatically verified' });
+  }
+  
+  if (!reason || reason.trim().length === 0) {
+    return res.status(400).json({ error: 'Reason is required' });
+  }
+  
+  try {
+    // Check if user already has a pending request
+    const existingRequest = await pool.query(
+      `SELECT id FROM verification_requests WHERE user_id = $1 AND status = 'PENDING'`,
+      [userId]
+    );
+    
+    if (existingRequest.rows.length > 0) {
+      return res.status(400).json({ error: 'You already have a pending verification request' });
+    }
+    
+    // Check if user is already verified
+    const userResult = await pool.query(
+      'SELECT verified FROM users WHERE id = $1',
+      [userId]
+    );
+    
+    if (userResult.rows.length > 0 && userResult.rows[0].verified) {
+      return res.status(400).json({ error: 'You are already verified' });
+    }
+    
+    // Create verification request
+    const result = await pool.query(
+      `INSERT INTO verification_requests (user_id, reason, question1_answer, question2_answer, question3_answer, status)
+       VALUES ($1, $2, $3, $4, $5, 'PENDING')
+       RETURNING id, created_at`,
+      [userId, reason.trim(), question1_answer || null, question2_answer || null, question3_answer || null]
+    );
+    
+    console.log(`[VERIFICATION REQUEST] Request created: ${result.rows[0].id}`);
+    res.json({ success: true, requestId: result.rows[0].id, message: 'Verification request submitted successfully' });
+  } catch (err) {
+    console.error(`[VERIFICATION REQUEST] Error:`, err.message);
+    res.status(500).json({ error: 'Could not submit verification request' });
+  }
+});
+
+// 17b. GET MY VERIFICATION REQUEST STATUS
+app.get('/verification/request/status', authenticate, async (req, res) => {
+  const userId = req.user.id;
+  
+  try {
+    const result = await pool.query(
+      `SELECT id, reason, question1_answer, question2_answer, question3_answer, 
+              status, reviewed_by, reviewed_at, rejection_reason, created_at, updated_at
+       FROM verification_requests
+       WHERE user_id = $1
+       ORDER BY created_at DESC
+       LIMIT 1`,
+      [userId]
+    );
+    
+    if (result.rows.length === 0) {
+      return res.json({ hasRequest: false });
+    }
+    
+    const request = result.rows[0];
+    
+    // Get reviewer info if reviewed
+    let reviewer = null;
+    if (request.reviewed_by) {
+      const reviewerResult = await pool.query(
+        'SELECT id, username, full_name FROM users WHERE id = $1',
+        [request.reviewed_by]
+      );
+      if (reviewerResult.rows.length > 0) {
+        reviewer = reviewerResult.rows[0];
+      }
+    }
+    
+    res.json({
+      hasRequest: true,
+      request: {
+        ...request,
+        reviewer
+      }
+    });
+  } catch (err) {
+    console.error(`[VERIFICATION REQUEST STATUS] Error:`, err.message);
+    res.status(500).json({ error: 'Could not fetch verification request status' });
+  }
+});
+
+// 17c. GET ALL VERIFICATION REQUESTS (Moderator only)
+app.get('/admin/verification-requests', authenticate, async (req, res) => {
+  const userRole = req.user.role;
+  
+  if (userRole !== 'MODERATOR' && userRole !== 'ADMIN') {
+    return res.status(403).json({ error: 'Only moderators can view verification requests' });
+  }
+  
+  try {
+    const result = await pool.query(`
+      SELECT 
+        vr.id,
+        vr.user_id,
+        vr.reason,
+        vr.question1_answer,
+        vr.question2_answer,
+        vr.question3_answer,
+        vr.status,
+        vr.reviewed_by,
+        vr.reviewed_at,
+        vr.rejection_reason,
+        vr.created_at,
+        vr.updated_at,
+        u.username,
+        u.full_name,
+        u.avatar_url,
+        u.role,
+        u.email,
+        u.verified
+      FROM verification_requests vr
+      JOIN users u ON vr.user_id = u.id
+      WHERE vr.status = 'PENDING'
+      ORDER BY vr.created_at DESC
+    `);
+    
+    res.json(result.rows);
+  } catch (err) {
+    console.error(`[VERIFICATION REQUESTS] Error:`, err.message);
+    res.status(500).json({ error: 'Could not fetch verification requests' });
+  }
+});
+
+// 17d. APPROVE VERIFICATION REQUEST (Moderator only)
+app.post('/admin/verification-requests/:id/approve', authenticate, async (req, res) => {
+  const { id: requestId } = req.params;
+  const moderatorId = req.user.id;
+  const userRole = req.user.role;
+  
+  if (userRole !== 'MODERATOR' && userRole !== 'ADMIN') {
+    return res.status(403).json({ error: 'Only moderators can approve verification requests' });
+  }
+  
+  console.log(`[APPROVE VERIFICATION] Moderator ${moderatorId} approving request ${requestId}`);
+  
+  try {
+    // Get the request
+    const requestResult = await pool.query(
+      'SELECT user_id, status FROM verification_requests WHERE id = $1',
+      [requestId]
+    );
+    
+    if (requestResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Verification request not found' });
+    }
+    
+    const request = requestResult.rows[0];
+    
+    if (request.status !== 'PENDING') {
+      return res.status(400).json({ error: 'Request is not pending' });
+    }
+    
+    // Update request status
+    await pool.query(
+      `UPDATE verification_requests 
+       SET status = 'APPROVED', reviewed_by = $1, reviewed_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+       WHERE id = $2`,
+      [moderatorId, requestId]
+    );
+    
+    // Mark user as verified
+    await pool.query(
+      'UPDATE users SET verified = TRUE WHERE id = $1',
+      [request.user_id]
+    );
+    
+    console.log(`[APPROVE VERIFICATION] User ${request.user_id} is now verified`);
+    res.json({ success: true, message: 'Verification request approved' });
+  } catch (err) {
+    console.error(`[APPROVE VERIFICATION] Error:`, err.message);
+    res.status(500).json({ error: 'Could not approve verification request' });
+  }
+});
+
+// 17e. REJECT VERIFICATION REQUEST (Moderator only)
+app.post('/admin/verification-requests/:id/reject', authenticate, async (req, res) => {
+  const { id: requestId } = req.params;
+  const { rejectionReason } = req.body;
+  const moderatorId = req.user.id;
+  const userRole = req.user.role;
+  
+  if (userRole !== 'MODERATOR' && userRole !== 'ADMIN') {
+    return res.status(403).json({ error: 'Only moderators can reject verification requests' });
+  }
+  
+  console.log(`[REJECT VERIFICATION] Moderator ${moderatorId} rejecting request ${requestId}`);
+  
+  try {
+    // Get the request
+    const requestResult = await pool.query(
+      'SELECT user_id, status FROM verification_requests WHERE id = $1',
+      [requestId]
+    );
+    
+    if (requestResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Verification request not found' });
+    }
+    
+    const request = requestResult.rows[0];
+    
+    if (request.status !== 'PENDING') {
+      return res.status(400).json({ error: 'Request is not pending' });
+    }
+    
+    // Update request status
+    await pool.query(
+      `UPDATE verification_requests 
+       SET status = 'REJECTED', reviewed_by = $1, reviewed_at = CURRENT_TIMESTAMP, 
+           rejection_reason = $2, updated_at = CURRENT_TIMESTAMP
+       WHERE id = $3`,
+      [moderatorId, rejectionReason || null, requestId]
+    );
+    
+    console.log(`[REJECT VERIFICATION] Request ${requestId} rejected`);
+    res.json({ success: true, message: 'Verification request rejected' });
+  } catch (err) {
+    console.error(`[REJECT VERIFICATION] Error:`, err.message);
+    res.status(500).json({ error: 'Could not reject verification request' });
+  }
+});
+
 // 18. VERIFY USER (Moderator only - verify NPI/State License)
 app.post('/admin/verify-user/:id', authenticate, async (req, res) => {
   const { id: userId } = req.params;
@@ -4116,9 +4448,29 @@ const initDb = async () => {
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
             
+            CREATE TABLE IF NOT EXISTS verification_requests (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+                reason TEXT NOT NULL,
+                question1_answer TEXT,
+                question2_answer TEXT,
+                question3_answer TEXT,
+                status VARCHAR(20) DEFAULT 'PENDING',
+                reviewed_by UUID REFERENCES users(id) ON DELETE SET NULL,
+                reviewed_at TIMESTAMP,
+                rejection_reason TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(user_id, status) WHERE status = 'PENDING'
+            );
+            
             CREATE INDEX IF NOT EXISTS idx_invite_codes_code ON invite_codes(code);
             CREATE INDEX IF NOT EXISTS idx_invite_codes_created_by ON invite_codes(created_by);
             CREATE INDEX IF NOT EXISTS idx_invite_codes_is_active ON invite_codes(is_active);
+            
+            CREATE INDEX IF NOT EXISTS idx_verification_requests_user_id ON verification_requests(user_id);
+            CREATE INDEX IF NOT EXISTS idx_verification_requests_status ON verification_requests(status);
+            CREATE INDEX IF NOT EXISTS idx_verification_requests_created_at ON verification_requests(created_at);
             
             -- Search performance indexes
             CREATE INDEX IF NOT EXISTS idx_users_username_lower ON users(LOWER(username));
@@ -4176,6 +4528,7 @@ app.listen(PORT, '0.0.0.0', async () => {
     console.log(`  POST   /auth/resend-verification (resend verification email)`);
     console.log(`  POST   /auth/forgot-password (request password reset)`);
     console.log(`  POST   /auth/reset-password (reset password with token)`);
+    console.log(`  POST   /auth/change-password (change password with current password verification)`);
     console.log(`  GET    /feed (with pagination)`);
     console.log(`  POST   /posts (auth required, role-based permissions)`);
     console.log(`  DELETE /posts/:id (auth required)`);
@@ -4193,6 +4546,11 @@ app.listen(PORT, '0.0.0.0', async () => {
     console.log(`  GET    /shared/:token (external share links)`);
     console.log(`  GET    /search?q=query&type=all|users|posts`);
     console.log(`  POST   /admin/verify-user/:id (moderator only)`);
+    console.log(`  POST   /verification/request (submit verification badge request)`);
+    console.log(`  GET    /verification/request/status (get my verification request status)`);
+    console.log(`  GET    /admin/verification-requests (moderator only - get all pending requests)`);
+    console.log(`  POST   /admin/verification-requests/:id/approve (moderator only)`);
+    console.log(`  POST   /admin/verification-requests/:id/reject (moderator only)`);
     // Wait a bit for DB to be ready in Docker
     setTimeout(initDb, 5000);
 });
