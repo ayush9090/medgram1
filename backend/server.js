@@ -514,10 +514,10 @@ app.post('/auth/register', async (req, res) => {
   }
 });
 
-// 2. LOGIN (Updated per MIB Layout - supports email or phone)
+// 2. LOGIN (Updated per MIB Layout - supports email or phone, with Remember Me)
 app.post('/auth/login', async (req, res) => {
-  const { username, password, twoFactorCode } = req.body; // username can be email or phone
-  console.log(`[LOGIN] Attempting login for user: ${username}`);
+  const { username, password, twoFactorCode, rememberMe } = req.body; // username can be email or phone
+  console.log(`[LOGIN] Attempting login for user: ${username}, rememberMe: ${rememberMe || false}`);
   
   try {
     // Support login with email or phone number
@@ -566,7 +566,10 @@ app.post('/auth/login', async (req, res) => {
       }
     }
 
-    const token = jwt.sign({ id: user.id, role: user.role }, JWT_SECRET, { expiresIn: JWT_EXPIRY });
+    // Use longer expiry for "Remember Me" (30 days) vs default (7 days)
+    const tokenExpiry = rememberMe ? '30d' : JWT_EXPIRY;
+    const token = jwt.sign({ id: user.id, role: user.role }, JWT_SECRET, { expiresIn: tokenExpiry });
+    console.log(`[LOGIN] Token created with expiry: ${tokenExpiry} (rememberMe: ${rememberMe || false})`);
     // Remove sensitive data from response
     delete user.password_hash;
     delete user.verification_code;
