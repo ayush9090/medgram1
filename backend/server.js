@@ -4460,17 +4460,23 @@ const initDb = async () => {
                 reviewed_at TIMESTAMP,
                 rejection_reason TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE(user_id, status) WHERE status = 'PENDING'
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
             
             CREATE INDEX IF NOT EXISTS idx_invite_codes_code ON invite_codes(code);
             CREATE INDEX IF NOT EXISTS idx_invite_codes_created_by ON invite_codes(created_by);
             CREATE INDEX IF NOT EXISTS idx_invite_codes_is_active ON invite_codes(is_active);
             
+            -- Create indexes for verification_requests table
             CREATE INDEX IF NOT EXISTS idx_verification_requests_user_id ON verification_requests(user_id);
             CREATE INDEX IF NOT EXISTS idx_verification_requests_status ON verification_requests(status);
             CREATE INDEX IF NOT EXISTS idx_verification_requests_created_at ON verification_requests(created_at);
+            
+            -- Create partial unique index to ensure only one pending request per user
+            -- Note: Partial indexes with WHERE clause may need the table to exist first
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_verification_requests_user_pending 
+            ON verification_requests(user_id) 
+            WHERE status = 'PENDING';
             
             -- Search performance indexes
             CREATE INDEX IF NOT EXISTS idx_users_username_lower ON users(LOWER(username));
@@ -4495,8 +4501,21 @@ const initDb = async () => {
             CREATE INDEX IF NOT EXISTS idx_forwards_post_id ON forwards(post_id);
         `);
         console.log("[DB INIT] Database tables initialized successfully");
+        
+        // Verify critical tables exist
+        const tablesCheck = await pool.query(`
+            SELECT table_name 
+            FROM information_schema.tables 
+            WHERE table_schema = 'public' 
+            AND table_name IN ('users', 'posts', 'verification_requests', 'invite_codes')
+            ORDER BY table_name
+        `);
+        console.log("[DB INIT] Verified tables:", tablesCheck.rows.map(r => r.table_name).join(', '));
     } catch(e) {
         console.error("[DB INIT] Error:", e.message);
+        console.error("[DB INIT] Stack:", e.stack);
+        // Don't throw - allow server to continue running even if DB init has issues
+        // Tables will be created on next restart or can be created manually
     }
 }
 
